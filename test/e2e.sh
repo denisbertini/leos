@@ -87,6 +87,8 @@ echo "== 10. single-unit <path> addressing works"
 mkunit chk000015.bp5 1
 $LEOS archive "$SCRATCH/chk000015.bp5" --dest "$EOS" 2>&1 >/dev/null
 [ -f "$EOS/chk000015.bp5/.archived" ] || fail "single-unit archive"
+grep -qF ".leos" "$EOS/chk000015.bp5/.archived" && fail "tool state leaked into manifest"
+[ ! -e "$EOS/chk000015.bp5/.leos" ] || fail "tool state copied into archive"
 
 echo
 echo "E2E PASS  ($T left for inspection)"

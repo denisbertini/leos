@@ -238,6 +238,9 @@ pub fn walk_unit(unit_dir: &Path, hash: bool) -> Result<Walked, String> {
             let name = ent.file_name().to_string_lossy().to_string();
             let ft = ent.file_type().map_err(|e| e.to_string())?;
             if ft.is_dir() {
+                if name == STATE_DIR {
+                    continue; // tool state (lock/records) is never payload
+                }
                 stack.push(ent.path());
                 continue;
             }
