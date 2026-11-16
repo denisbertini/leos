@@ -3,7 +3,7 @@ name = "leos"
 version = "0.1.0"
 edition = "2021"
 description = "Marker-chained checkpoint archiving between Lustre scratch and EOS (bbstage companion)"
-license = "MIT OR Apache-2.0"
+license = "GPL-3.0-or-later"
 
 [[bin]]
 name = "leos"

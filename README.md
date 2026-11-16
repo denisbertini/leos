@@ -144,4 +144,4 @@ instance — start with `--dry-run` and `leos status`.
 
 ## License
 
-MIT OR Apache-2.0.
+GPL-3.0-or-later. See `LICENSE`.
