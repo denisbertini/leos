@@ -101,8 +101,10 @@ pub fn discover(root: &Path, marker: &str) -> Vec<Unit> {
 }
 
 fn unit_meta(dir: &Path) -> (String, u64) {
-    let name = dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    let mtime = std::fs::metadata(dir)
+    // canonicalize so "." and other relative spellings still name the unit
+    let real = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let name = real.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let mtime = std::fs::metadata(&real)
         .ok()
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())

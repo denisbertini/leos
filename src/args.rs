@@ -39,6 +39,15 @@ impl Args {
                         eprintln!("--{rest} needs a value");
                         std::process::exit(2);
                     });
+                    if v.starts_with("--") {
+                        // the classic failure: `--dest` with an unset shell
+                        // variable eats the NEXT flag as its value
+                        eprintln!(
+                            "--{rest} needs a value, got flag '{v}' \
+                             (empty shell variable? check your exports)"
+                        );
+                        std::process::exit(2);
+                    }
                     a.opts.insert(rest.to_string(), v);
                 } else {
                     a.flags.insert(rest.to_string());
