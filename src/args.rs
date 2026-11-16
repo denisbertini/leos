@@ -24,6 +24,7 @@ impl Args {
             "watch",
             "max-gib",
             "older-than-hours",
+            "token",
         ];
         let mut a =
             Args { sub: None, pos: Vec::new(), opts: HashMap::new(), flags: HashSet::new() };

@@ -2,6 +2,13 @@
 //! orchestrates `eos cp` (EOS console) or `xrdcp`/`xrdfs` (xrootd clients),
 //! so site authentication (kinit, tokens) stays with the tools that already
 //! work. `Copy` is a local-filesystem backend for testing and dry-runs.
+//!
+//! Capability tokens (Helios-style): the token is handed to every child as
+//! `EOSAUTHZ` (metadata ops: mkdir/mv/rm/file stat authenticate that way) and
+//! appended as `?authz=` on copy URLs (data transfer). Reads through
+//! `eos cp` with a token are refused: the XRootD client applies authz only
+//! to copy *destinations*, never sources (known eos cp_cmd_native.cc bug),
+//! so downloads must go through xrdcp with the token on the source URL.
 
 use std::path::Path;
 use std::process::Command;
@@ -33,6 +40,9 @@ pub struct Backend {
     pub extra: Vec<String>,
     /// xrdcp backend: host parsed from root://HOST//path
     host: Option<String>,
+    /// capability token (Helios EOS): children get $EOSAUTHZ, copy URLs get
+    /// `?authz=`; empty string counts as no token.
+    token: Option<String>,
 }
 
 pub fn is_remote(path: &str) -> bool {
@@ -59,7 +69,13 @@ fn err_cmd(what: &str, cmd: &std::process::Output) -> String {
 impl Backend {
     /// `--backend auto|eoscp|xrdcp|copy`; auto: root:// -> xrdcp,
     /// /eos/ -> eoscp, anything else -> copy (local path).
-    pub fn from_args(kind: &str, path: &str, streams: usize, extra: &str) -> R<Backend> {
+    pub fn from_args(
+        kind: &str,
+        path: &str,
+        streams: usize,
+        extra: &str,
+        token: Option<&str>,
+    ) -> R<Backend> {
         let kind = match kind {
             "auto" if path.starts_with("root://") => Kind::Xrdcp,
             "auto" if path.starts_with("/eos/") => Kind::EosCp,
@@ -89,11 +105,22 @@ impl Backend {
             streams,
             extra: extra.split_whitespace().map(|s| s.to_string()).collect(),
             host,
+            token: token.filter(|t| !t.is_empty()).map(|s| s.to_string()),
         })
     }
 
     fn host(&self) -> R<&str> {
         self.host.as_deref().ok_or("internal: missing host".to_string())
+    }
+
+    /// every child process carries the token in the environment, which is
+    /// how the EOS console authenticates metadata operations (`EOSAUTHZ`)
+    fn cmd(&self, prog: &str) -> Command {
+        let mut c = Command::new(prog);
+        if let Some(t) = &self.token {
+            c.env("EOSAUTHZ", t);
+        }
+        c
     }
 
     pub fn join(base: &str, rel: &str) -> String {
@@ -106,10 +133,31 @@ impl Backend {
         }
     }
 
+    /// xrdfs takes host + bare path, not URLs: strip root://HOST and
+    /// collapse the canonical double slash (root://h//eos/x -> /eos/x).
+    pub fn rpath(p: &str) -> &str {
+        match p.strip_prefix("root://") {
+            Some(rest) => match rest.find('/') {
+                Some(i) => {
+                    let after = &rest[i..];
+                    after.strip_prefix('/').unwrap_or(after)
+                }
+                None => "/",
+            },
+            None => p,
+        }
+    }
+
+    /// full xrootd URL for copy commands, token appended as an authz query
     fn url(&self, path: &str) -> String {
-        match self.kind {
+        let base = match self.kind {
+            Kind::Xrdcp if path.starts_with("root://") => path.to_string(),
             Kind::Xrdcp => format!("root://{}{}", self.host.as_deref().unwrap_or(""), path),
             _ => path.to_string(),
+        };
+        match &self.token {
+            Some(t) if !base.contains("?authz=") => format!("{base}?authz={t}"),
+            _ => base,
         }
     }
 
@@ -129,12 +177,16 @@ impl Backend {
         match self.kind {
             Kind::Copy => Some(Path::new(path).exists()),
             Kind::EosCp => {
-                let out = Command::new("eos").args(["file", "stat", path]).output().ok()?;
+                let out = self.cmd("eos").args(["file", "stat", path]).output().ok()?;
                 Some(out.status.success())
             }
             Kind::Xrdcp => {
                 let h = self.host.as_deref()?;
-                let out = Command::new("xrdfs").args([h, "stat", path]).output().ok()?;
+                let out = self
+                    .cmd("xrdfs")
+                    .args([h, "stat", Self::rpath(path)])
+                    .output()
+                    .ok()?;
                 Some(out.status.success()
                     && String::from_utf8_lossy(&out.stdout).contains("Status=OK"))
             }
@@ -145,7 +197,7 @@ impl Backend {
         match self.kind {
             Kind::Copy => std::fs::metadata(path).ok().map(|m| m.len()),
             Kind::EosCp => {
-                let o = Command::new("eos").args(["file", "stat", path]).output().ok()?;
+                let o = self.cmd("eos").args(["file", "stat", path]).output().ok()?;
                 if !o.status.success() {
                     return None;
                 }
@@ -153,7 +205,11 @@ impl Backend {
             }
             Kind::Xrdcp => {
                 let h = self.host.as_deref()?;
-                let o = Command::new("xrdfs").args([h, "stat", path]).output().ok()?;
+                let o = self
+                    .cmd("xrdfs")
+                    .args([h, "stat", Self::rpath(path)])
+                    .output()
+                    .ok()?;
                 if !o.status.success() {
                     return None;
                 }
@@ -168,7 +224,7 @@ impl Backend {
                 std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir))
             }
             Kind::EosCp => {
-                let o = Command::new("eos").args(["mkdir", "-p", dir]).output()
+                let o = self.cmd("eos").args(["mkdir", "-p", dir]).output()
                     .map_err(|e| format!("spawn eos mkdir: {e}"))?;
                 if o.status.success() || self.exists(dir) == Some(true) {
                     Ok(())
@@ -178,9 +234,10 @@ impl Backend {
             }
             Kind::Xrdcp => {
                 let h = self.host()?;
-                let o = Command::new("xrdfs").args([h, "mkdir", "-p", dir]).output()
+                let dir = Self::rpath(dir).to_string();
+                let o = self.cmd("xrdfs").args([h, "mkdir", "-p", &dir]).output()
                     .map_err(|e| format!("spawn xrdfs mkdir: {e}"))?;
-                if o.status.success() || self.exists(dir) == Some(true) {
+                if o.status.success() || self.exists(&dir) == Some(true) {
                     return Ok(());
                 }
                 // fallback without -p: create ancestors one by one
@@ -190,9 +247,9 @@ impl Backend {
                         continue;
                     }
                     cur = format!("{cur}/{part}");
-                    let _ = Command::new("xrdfs").args([h, "mkdir", &cur]).output();
+                    let _ = self.cmd("xrdfs").args([h, "mkdir", &cur]).output();
                 }
-                if self.exists(dir) == Some(true) {
+                if self.exists(&dir) == Some(true) {
                     Ok(())
                 } else {
                     Err(err_cmd(&format!("xrdfs mkdir {dir}"), &o))
@@ -210,16 +267,19 @@ impl Backend {
                 std::fs::copy(local, remote).map(|_| ()).map_err(|e| e.to_string())
             }
             Kind::EosCp => {
-                let mut c = Command::new("eos");
+                // destination carries the token (the documented-working form:
+                // `eos cp <local> "/eos/path?authz=$TOKEN"`); authz on copy
+                // *sources* is what the eos client cannot do.
+                let mut c = self.cmd("eos");
                 c.args(["cp", "-n", "--streams"]);
                 c.arg(self.streams.to_string());
                 c.args(&self.extra);
-                c.arg(local).arg(remote);
+                c.arg(local).arg(self.url(remote));
                 let o = c.output().map_err(|e| format!("spawn eos cp: {e}"))?;
                 if o.status.success() { Ok(()) } else { Err(err_cmd("eos cp", &o)) }
             }
             Kind::Xrdcp => {
-                let mut c = Command::new("xrdcp");
+                let mut c = self.cmd("xrdcp");
                 c.args(["-f", "--streams"]);
                 c.arg(self.streams.to_string());
                 c.args(&self.extra);
@@ -239,7 +299,17 @@ impl Backend {
                 std::fs::copy(remote, local).map(|_| ()).map_err(|e| e.to_string())
             }
             Kind::EosCp => {
-                let mut c = Command::new("eos");
+                if self.token.is_some() {
+                    return Err(
+                        "reading with a capability token through `eos cp` is unsupported: the \
+                         XRootD client applies authz only to copy destinations, never sources \
+                         (known eos bug). Address the unit as root://<mgm-host>//eos/... instead \
+                         -- that auto-selects the xrdcp backend, which puts the token on the \
+                         source URL."
+                            .to_string(),
+                    );
+                }
+                let mut c = self.cmd("eos");
                 c.args(["cp", "-n", "--streams"]);
                 c.arg(self.streams.to_string());
                 c.args(&self.extra);
@@ -248,7 +318,7 @@ impl Backend {
                 if o.status.success() { Ok(()) } else { Err(err_cmd("eos cp (get)", &o)) }
             }
             Kind::Xrdcp => {
-                let mut c = Command::new("xrdcp");
+                let mut c = self.cmd("xrdcp");
                 c.args(["-f", "--streams"]);
                 c.arg(self.streams.to_string());
                 c.args(&self.extra);
@@ -268,13 +338,14 @@ impl Backend {
                 std::fs::rename(from, to).map_err(|e| format!("rename: {e}"))
             }
             Kind::EosCp => {
-                let o = Command::new("eos").args(["mv", from, to]).output()
+                let o = self.cmd("eos").args(["mv", from, to]).output()
                     .map_err(|e| format!("spawn eos mv: {e}"))?;
                 if o.status.success() { Ok(()) } else { Err(err_cmd("eos mv", &o)) }
             }
             Kind::Xrdcp => {
                 let h = self.host()?;
-                let o = Command::new("xrdfs").args([h, "mv", from, to]).output()
+                let (from, to) = (Self::rpath(from), Self::rpath(to));
+                let o = self.cmd("xrdfs").args([h, "mv", from, to]).output()
                     .map_err(|e| format!("spawn xrdfs mv: {e}"))?;
                 if o.status.success() { Ok(()) } else { Err(err_cmd("xrdfs mv", &o)) }
             }
@@ -295,7 +366,7 @@ impl Backend {
                 }
             }
             Kind::EosCp => {
-                let o = Command::new("eos").args(["rm", "-f", path]).output()
+                let o = self.cmd("eos").args(["rm", "-f", path]).output()
                     .map_err(|e| format!("spawn eos rm: {e}"))?;
                 if o.status.success() || self.exists(path) != Some(true) {
                     Ok(())
@@ -305,7 +376,7 @@ impl Backend {
             }
             Kind::Xrdcp => {
                 let h = self.host()?;
-                let _ = Command::new("xrdfs").args([h, "rm", path]).output()
+                let _ = self.cmd("xrdfs").args([h, "rm", Self::rpath(path)]).output()
                     .map_err(|e| format!("spawn xrdfs rm: {e}"))?;
                 Ok(())
             }
@@ -323,7 +394,7 @@ impl Backend {
                 }
             }
             Kind::EosCp => {
-                let o = Command::new("eos").args(["rm", "-rf", path]).output()
+                let o = self.cmd("eos").args(["rm", "-rf", path]).output()
                     .map_err(|e| format!("spawn eos rm -rf: {e}"))?;
                 if o.status.success() { Ok(()) } else { Err(err_cmd("eos rm -rf", &o)) }
             }
@@ -360,12 +431,33 @@ mod tests {
     #[test]
     fn url_parse() {
         let b =
-            Backend::from_args("auto", "root://eosxyz.cern.ch//eos/xyz/user/u1", 8, "").unwrap();
+            Backend::from_args("auto", "root://eosxyz.cern.ch//eos/xyz/user/u1", 8, "", None)
+                .unwrap();
         assert_eq!(b.kind, Kind::Xrdcp);
         assert_eq!(b.host.as_deref(), Some("eosxyz.cern.ch"));
         assert_eq!(Backend::join("root://h//eos/a/b", "c/d.txt"), "root://h//eos/a/b/c/d.txt");
         assert_eq!(Backend::join("/eos/a/b/", "/c"), "/eos/a/b/c");
-        assert!(Backend::from_args("auto", "root://h/eos/a", 1, "").is_err()); // single slash
+        assert!(Backend::from_args("auto", "root://h/eos/a", 1, "", None).is_err()); // single slash
+    }
+
+    #[test]
+    fn token_urls_and_rpath() {
+        // full URLs pass through url() unharmed (no prefix doubling)
+        let b = Backend::from_args("auto", "root://h//eos/a", 4, "", Some("TOKEN+eq/==")).unwrap();
+        assert_eq!(b.url("root://h//eos/a/f1"), "root://h//eos/a/f1?authz=TOKEN+eq/==");
+        // bare paths get the host, and the token
+        assert_eq!(b.url("/eos/a/f1"), "root://h/eos/a/f1?authz=TOKEN+eq/==");
+        // xrdfs wants the bare path, not the URL
+        assert_eq!(Backend::rpath("root://h//eos/a/b"), "/eos/a/b");
+        assert_eq!(Backend::rpath("/eos/a/b"), "/eos/a/b");
+        // no token => no query anywhere
+        let b0 = Backend::from_args("auto", "root://h//eos/a", 4, "", None).unwrap();
+        assert_eq!(b0.url("root://h//eos/a/f1"), "root://h//eos/a/f1");
+        // console reads with a token are refused (eos source-authz bug)
+        let e = Backend::from_args("auto", "/eos/a", 4, "", Some("T")).unwrap();
+        assert_eq!(e.kind, Kind::EosCp);
+        let err = e.copy_from("/eos/a/f1", Path::new("/nonexistent/x")).unwrap_err();
+        assert!(err.contains("xrdcp") && err.contains("source"), "{err}");
     }
 
     #[test]

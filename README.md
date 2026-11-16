@@ -71,18 +71,47 @@ python3 -c "import zlib,sys; print(hex(zlib.adler32(open(sys.argv[1],'rb').read(
 `--no-checksum` archives with sizes only (faster first pass; restore then
 verifies sizes only — not recommended for long-lived archives).
 
-## GSI example
+## GSI example (Helios EOS, capability tokens)
+
+Helios authorizes through signed, path-scoped, expiring tokens minted by
+the EOS instance itself after a Kerberos-authenticated session (an admin
+must create your top directory once before you can mint tokens for it):
 
 ```bash
-export LEOS_DEST=root://eos.gsi.de//eos/<project>/<group>/warpx
-# watch a scratch tree, archiving checkpoints as they complete:
-leos archive /lustre/scratch/<user>/warpx/diags --streams 8 --watch 60
-leos status  /lustre/scratch/<user>/warpx/diags
-leos verify  root://eos.gsi.de//eos/<project>/<group>/warpx/openpmd_000050.bp5 --round-trip
-leos restore root://eos.gsi.de//eos/<project>/<group>/warpx/openpmd_000050.bp5 \
-             --dest /lustre/scratch/<user>/restart
-leos purge   /lustre/scratch/<user>/warpx/diags --yes   # licensed units only
+# on a Kerberized host with the eos client (e.g. lxbk0960.gsi.de):
+kinit dbertini
+export EOS_MGM_URL=root://helios.hpc.gsi.de
+export EOSAUTHZ=$(eos token --path /eos/helios/Users/dbertini/ \
+    --permission rwx --tree --expires $(( $(date +%s) + 60*60*8 )))
+
+# WRITES + metadata via the eos console (EOSAUTHZ env is picked up by leos):
+export LEOS_DEST=/eos/helios/Users/dbertini/warpx
+leos archive /lustre/scratch/warpx/diags --streams 8
+leos status  /lustre/scratch/warpx/diags
+leos purge   /lustre/scratch/warpx/diags --yes
+
+# READS via xrdcp with ?authz= on the source URL -- `eos cp` cannot read
+# with a token (upstream XRootD bug: authz applies to destinations only):
+leos verify  root://helios.hpc.gsi.de//eos/helios/Users/dbertini/warpx/openpmd_000050.bp5 --round-trip
+leos restore root://helios.hpc.gsi.de//eos/helios/Users/dbertini/warpx/openpmd_000050.bp5 \
+             --dest /lustre/restart
 ```
+
+leos precedence for the token: `--token=...`, then `$LEOS_TOKEN`, then
+`$EOSAUTHZ`. It injects `EOSAUTHZ` into every `eos`/`xrdcp`/`xrdfs` child
+and appends `?authz=` to copy URLs.
+
+Tokens expire (8 h in the example above) — during a long `--watch` run the
+archiver will start failing on auth. That is operationally safe: every leos
+failure is resumable (`.incomplete` trees are reused, janitor sweeps stale
+ones, licenses appear only after full verification), so the recovery is
+exactly "mint a new token, rerun". For unattended operation prefer one-shot
+`leos archive` passes from a scheduler loop that re-mints the token each
+pass.
+
+Tokens in copy commands are visible in `ps` on shared nodes. They are
+path-scoped and short-lived by construction — keep the expiry tight, and
+prefer running archivers on dedicated nodes.
 
 `bbstage` with `Aggregate=on` shapes the Lustre output into few, large files;
 that object count carries over to EOS and is what makes the archive
@@ -93,8 +122,10 @@ comfortable for the object store.
 leos never speaks a protocol; it shells out to the site tools that already
 work — `eos cp/mv/mkdir/rm/file stat` for `/eos/...` paths, `xrdcp`/`xrdfs`
 for `root://host//path` URLs. Whatever you have authenticated with (kinit,
-XrdSciTokens, the EOS console) keeps working; leos inherits it. `--extra-args`
-passes site flags (e.g. auth files) through to every copy command.
+capability tokens) keeps working; leos inherits it. For Helios-style
+capability tokens leos passes `$EOSAUTHZ` to every child and appends
+`?authz=` to copy URLs (see the Helios example above — note the read-path
+restriction). `--extra-args` passes site flags through to every copy command.
 
 Backend selection: `--backend auto` (default) picks `xrdcp` for `root://`,
 `eoscp` for `/eos/`, and a local-filesystem `copy` backend otherwise (used by
@@ -114,6 +145,15 @@ the test suite, useful for tier-to-tier rehearsals).
   `size N`) but written against documented formats; the first run on a real
   EOS should be a `--dry-run` followed by one small unit and a
   `verify --round-trip`.
+- **Token support follows the site-demonstrated flows, not the theoretical
+  ones.** With a token: eos-console *writes and metadata* (`cp` to, `mkdir`,
+  `mv`, `rm`, `whoami` via `$EOSAUTHZ`) and `xrdcp` copies with `?authz=` on
+  either end are the operations Helios's own documentation demonstrates;
+  leos therefore routes archive through `/eos/...` paths (console backend)
+  and reads through `root://` URLs (xrdcp backend). Whether `xrdfs stat`
+  honors `$EOSAUTHZ` is XRootD-version-dependent — if remote `status
+  --remote` complains about permissions while archive works fine, that is
+  this gap, not a data problem.
 - Empty directories are not part of the manifest (bbstage output never has
   any; a checkpoint that needs them is not what this tool targets).
 - One archiver per scratch tree (pid lock in `<tree>/.leos/`); run either one
@@ -137,10 +177,17 @@ checksum, parser and pool internals.
 ## Status
 
 Internals unit-tested; the full lifecycle passes end-to-end against the
-`copy` backend. Behaviour against a real EOS instance (xrdfs stat formats,
-`eos mv` directory semantics, authentication edge cases) is written to the
-documented interfaces and needs one supervised first run on the target
-instance — start with `--dry-run` and `leos status`.
+`copy` backend. Behaviour against a real EOS instance is written to the
+documented (and, for Helios, admin-demonstrated) interfaces but still needs
+one supervised first run. The checklist:
+
+1. `kinit` → mint token → `EOSAUTHZ=$TOKEN eos whoami` shows your tree.
+2. Write probe: `leos archive <one small unit> --dest /eos/... --dry-run`,
+   then without `--dry-run`; confirm `eos file stat` reports expected sizes.
+3. `leos verify root://<mgm>//eos/.../<unit> --round-trip` — this is the
+   read path and the strongest single check of the whole chain.
+4. `leos restore ... --dest /tmp` and compare against scratch with `diff -r`.
+5. Only then point `purge` at a scratch tree.
 
 ## License
 

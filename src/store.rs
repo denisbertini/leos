@@ -37,6 +37,7 @@ fn cfg(a: &Args, ref_path: &str, streams_default: usize) -> R<Cfg> {
         ref_path,
         streams,
         a.opt("extra-args").unwrap_or(""),
+        token(a).as_deref(),
     )?;
     let seal_rename = match a.opt("seal").unwrap_or("auto") {
         "auto" => {
@@ -63,6 +64,21 @@ fn cfg(a: &Args, ref_path: &str, streams_default: usize) -> R<Cfg> {
 }
 
 // ------------------------------------------------------------------ archive
+
+/// capability token precedence: --token, $LEOS_TOKEN, $EOSAUTHZ
+fn token(a: &Args) -> Option<String> {
+    if let Some(t) = a.opt("token") {
+        return Some(t.to_string());
+    }
+    for var in ["LEOS_TOKEN", "EOSAUTHZ"] {
+        if let Ok(t) = std::env::var(var) {
+            if !t.is_empty() {
+                return Some(t);
+            }
+        }
+    }
+    None
+}
 
 pub fn run_archive(a: &Args) -> R<()> {
     let src = PathBuf::from(a.pos1("lustre-path")?);
@@ -256,7 +272,7 @@ pub fn run_status(a: &Args) -> R<()> {
     let mut mismatch = 0usize;
     let backend = if a.flag("remote") {
         let r = remote.as_deref().ok_or("--remote needs --dest or $LEOS_DEST")?;
-        Some(Backend::from_args(a.opt("backend").unwrap_or("auto"), r, 1, "")?)
+        Some(Backend::from_args(a.opt("backend").unwrap_or("auto"), r, 1, "", token(a).as_deref())?)
     } else {
         None
     };

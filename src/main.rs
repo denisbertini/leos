@@ -70,12 +70,27 @@ transfer options (archive/restore):
   --no-checksum                                sizes only (archive)
   --allow-unverified                           accept stores where stat fails
 
-examples (GSI):
-  export LEOS_DEST=root://eos.gsi.de//eos/yourgroup/warpx
-  leos archive /lustre/scratch/warpx/diags --streams 8 --watch 60
+capability tokens (Helios EOS):
+  --token=TOK   or $LEOS_TOKEN, or plain $EOSAUTHZ. The token is passed to
+                eos/xrdcp children as $EOSAUTHZ and appended as ?authz= on
+                copy URLs. Note: `eos cp` cannot READ with a token (upstream
+                XRootD bug: authz applies to destinations only), so restore
+                and verify --round-trip must address units as
+                root://<mgm-host>//eos/... (auto-selects the xrdcp backend).
+                Tokens expire -- leos failures are resumable: re-issue the
+                token, rerun; .incomplete trees are picked up or swept.
+
+examples (GSI Helios):
+  export EOS_MGM_URL=root://helios.hpc.gsi.de
+  export EOSAUTHZ=$(eos token --path /eos/helios/Users/$USER/ \
+      --permission rwx --tree --expires $(( $(date +%s) + 60*60*8 )))
+  export LEOS_DEST=/eos/helios/Users/$USER/warpx          # writes: eos console
+  leos archive /lustre/scratch/warpx/diags --streams 8
   leos status  /lustre/scratch/warpx/diags
-  leos verify  /lustre/scratch/warpx/diags/openpmd_000050.bp5
-  leos restore $LEOS_DEST/openpmd_000050.bp5 --dest /lustre/restart
+  # reads go through xrdcp with ?authz= (eos cp cannot read with tokens):
+  leos verify  root://helios.hpc.gsi.de//eos/helios/Users/$USER/warpx/openpmd_000050.bp5 --round-trip
+  leos restore root://helios.hpc.gsi.de//eos/helios/Users/$USER/warpx/openpmd_000050.bp5 \
+               --dest /lustre/restart
   leos purge   /lustre/scratch/warpx/diags --yes
 ";
 
