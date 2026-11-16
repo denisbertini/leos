@@ -149,7 +149,12 @@ pub fn run_archive(a: &Args) -> R<()> {
 
 fn archive_unit(c: &Cfg, dst: &str, state: &Path, u: &core::Unit) -> R<u64> {
     let t0 = epoch_now();
-    let walked = walk_unit(&u.path, c.hash)?;
+    // dry-run plans with metadata only: sizes and file lists, no hashing
+    let hash_now = c.hash && !c.dry;
+    if hash_now {
+        log(&format!("planning {}: hashing content (one pass over the bytes)...", u.name));
+    }
+    let walked = walk_unit(&u.path, hash_now, c.jobs)?;
     let bytes: u64 = walked.entries.iter().map(|e| e.size).sum();
     let dst_unit = Backend::join(dst, &u.name);
     let dst_target =
@@ -277,7 +282,7 @@ pub fn run_status(a: &Args) -> R<()> {
         None
     };
     for u in &units {
-        let w = walk_unit(&u.path, false).map_err(|e| e.to_string())?;
+        let w = walk_unit(&u.path, false, 1).map_err(|e| e.to_string())?;
         let bytes: u64 = w.entries.iter().map(|e| e.size).sum();
         if u.licensed {
             lic.0 += 1;
@@ -544,6 +549,13 @@ pub fn run_purge(a: &Args) -> R<()> {
     for u in units.iter().filter(|u| u.licensed) {
         let text = std::fs::read_to_string(u.path.join(LICENSE_NAME)).map_err(|e| e.to_string())?;
         let manifest = Manifest::parse(&text)?;
+        if c.hash {
+            log(&format!(
+                "verifying {} against its license (hashing {})...",
+                u.name,
+                human_bytes(manifest.total())
+            ));
+        }
         // license must describe the tree it licenses...
         manifest.verify_local(&u.path, c.hash).map_err(|e| {
             format!("{}: tree does not match its license ({e}) -- NOT purging", u.name)

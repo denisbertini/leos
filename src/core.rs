@@ -226,9 +226,10 @@ pub struct Walked {
     pub dirs: Vec<String>, // rel dirs needing remote pre-creation
 }
 
-/// Walk a unit, hashing content unless `hash == false`.
-pub fn walk_unit(unit_dir: &Path, hash: bool) -> Result<Walked, String> {
-    let mut entries = Vec::new();
+/// Walk a unit, hashing content unless `hash == false`. Listing is serial
+/// (metadata only); hashing runs `jobs` files concurrently.
+pub fn walk_unit(unit_dir: &Path, hash: bool, jobs: usize) -> Result<Walked, String> {
+    let mut raw: Vec<(String, PathBuf, u64)> = Vec::new();
     let mut stack: Vec<PathBuf> = vec![unit_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for ent in
@@ -263,9 +264,15 @@ pub fn walk_unit(unit_dir: &Path, hash: bool) -> Result<Walked, String> {
                 return Err(format!("tab/newline in file name unsupported: {rel}"));
             }
             let size = ent.metadata().map_err(|e| e.to_string())?.len();
-            let adler = if hash { adler32::hash_file(&ent.path())? } else { 0 };
-            entries.push(Entry { rel, size, adler });
+            raw.push((rel, ent.path(), size));
         }
+    }
+    let mut entries: Vec<Entry> = Vec::with_capacity(raw.len());
+    for r in parallel(raw, jobs, |_i, (rel, path, size)| -> Result<Entry, String> {
+        let adler = if hash { adler32::hash_file(&path)? } else { 0 };
+        Ok(Entry { rel, size, adler })
+    }) {
+        entries.push(r?);
     }
     entries.sort_by(|a, b| a.rel.cmp(&b.rel));
     let mut dirs = Vec::new();

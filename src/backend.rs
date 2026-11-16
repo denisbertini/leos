@@ -169,8 +169,14 @@ impl Backend {
         if self.make_dirs(&probe).is_err() {
             return false;
         }
-        let gone = self.remove(&probe).is_ok() && self.exists(&probe) != Some(true);
-        gone
+        // cleanup must succeed too; `eos rm -f` refuses directories, so
+        // escalate to a recursive remove before judging the store capable
+        if self.remove(&probe).is_err() || self.exists(&probe) == Some(true) {
+            if self.remove_tree(&probe).is_err() || self.exists(&probe) == Some(true) {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn exists(&self, path: &str) -> Option<bool> {
