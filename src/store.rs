@@ -80,6 +80,52 @@ fn token(a: &Args) -> Option<String> {
     None
 }
 
+/// Auth-class errors are systemic: a token that is missing or dead on one
+/// file will be dead on every remaining file. Continuing only burns planning.
+fn auth_suspect(e: &str) -> bool {
+    let l = e.to_lowercase();
+    [
+        "permission denied",
+        "public access",
+        "unauthenticat",
+        "authz",
+        "token",
+        "access denied",
+        "authoriz",
+        "[3010]",
+        "sfs_err_auth",
+    ]
+    .iter()
+    .any(|k| l.contains(k))
+}
+
+/// One authenticated write+delete at the destination before any hashing:
+/// missing tokens, dead tokens and unwritable trees fail in ~1 s, not after
+/// a TiB of planning.
+fn preflight_write(c: &Cfg, dst: &str) -> R<()> {
+    let probe = Backend::join(dst, ".leos-writeprobe");
+    let tmp = std::env::temp_dir().join(format!("leos-probe-{}", std::process::id()));
+    std::fs::write(&tmp, b"leos preflight").map_err(|e| e.to_string())?;
+    let r = c
+        .backend
+        .copy_to(&tmp, &probe)
+        .and_then(|()| match c.backend.size(&probe) {
+            Some(got) if got == 14 => Ok(()),
+            Some(got) => Err(format!("write probe has {got} bytes, expected 14")),
+            None => Ok(()), // stat-unsupported stores: the copy itself proved auth
+        });
+    let _ = c.backend.remove(&probe);
+    let _ = std::fs::remove_file(&tmp);
+    r.map_err(|e| {
+        format!(
+            "preflight write to {probe} failed: {e}\n\
+             check: $EOSAUTHZ minted and exported in THIS shell (echo ${{#EOSAUTHZ}}), \
+             xrdcp/eos on PATH ($PATH), token not expired, tree path exists. \
+             Nothing was transferred."
+        )
+    })
+}
+
 pub fn run_archive(a: &Args) -> R<()> {
     let src = PathBuf::from(a.pos1("lustre-path")?);
     if !src.is_dir() {
@@ -101,6 +147,10 @@ pub fn run_archive(a: &Args) -> R<()> {
         ),
         None => None,
     };
+    if !c.dry && crate::backend::is_remote(&dst) {
+        log("preflight: authenticated write probe at destination...");
+        preflight_write(&c, &dst)?;
+    }
     loop {
         let units = discover(&src, &c.marker);
         let pending: Vec<_> = units.into_iter().filter(|u| !u.licensed).collect();
@@ -123,6 +173,14 @@ pub fn run_archive(a: &Args) -> R<()> {
                 Err(e) => {
                     failed += 1;
                     log(&format!("FAILED {}: {e}", u.name));
+                    if auth_suspect(&e) {
+                        return Err(format!(
+                            "aborting the pass: authentication-class failure -- every \
+                             remaining unit would fail identically. Re-mint/re-export the \
+                             token, then rerun the same command (resumes where it stopped). \
+                             Original error: {e}"
+                        ));
+                    }
                     if a.flag("stop-on-error") {
                         return Err(format!("aborted on first failure: {e}"));
                     }
