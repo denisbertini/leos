@@ -166,9 +166,12 @@ impl Backend {
         }
     }
 
-    /// Conservative capability probe: can we create and remove directories
-    /// at the destination? True => honor atomic rename seals (verified at
-    /// seal time; rename failure is a hard error, never a silent downgrade).
+    /// Conservative capability probe: create, remove, AND rename a probe
+    /// directory at the destination. True => honor atomic rename seals.
+    /// (Field lesson, Helios: directory rename is token-denied even though
+    /// mkdir/rm succeed -- probing only the latter over-promises.)
+    /// Rename failure at real seal time stays a hard error, never a silent
+    /// downgrade.
     pub fn probe_dirs(&self, dst_root: &str) -> bool {
         let probe = Self::join(dst_root, ".leos-probe");
         if self.make_dirs(&probe).is_err() {
@@ -181,7 +184,23 @@ impl Backend {
                 return false;
             }
         }
-        true
+        // the seal needs directory RENAME specifically: try it for real
+        let from = Self::join(dst_root, ".leos-rename-a");
+        let to = Self::join(dst_root, ".leos-rename-b");
+        if self.make_dirs(&from).is_err() {
+            return false;
+        }
+        let _ = self.remove_tree(&to); // clear a stale probe target
+        match self.rename(&from, &to) {
+            Ok(()) => {
+                let _ = self.remove_tree(&to);
+                true
+            }
+            Err(_) => {
+                let _ = self.remove_tree(&from);
+                false
+            }
+        }
     }
 
     pub fn exists(&self, path: &str) -> Option<bool> {
