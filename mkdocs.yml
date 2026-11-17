@@ -1,0 +1,50 @@
+site_name: leos
+site_description: License-gated archive and restore of bbstage checkpoints between Lustre scratch and EOS
+site_url: https://denisbertini.github.io/leos/
+repo_url: https://github.com/denisbertini/leos
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: blue grey
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - scheme: slate
+      primary: blue grey
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - content.code.copy
+    - toc.follow
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+extra_css:
+  - stylesheets/extra.css
+
+nav:
+  - Home: index.md
+  - Quickstart: quickstart.md
+  - Contract semantics: contract.md
+  - CLI reference: reference.md
+  - GSI Helios site guide: gsi-helios.md
+  - Troubleshooting: troubleshooting.md

@@ -1,0 +1,7 @@
+/* Identifier tables (wrapped in <div class="opt-names">): keep the option
+   column on one line so long flags like --allow-unverified are never
+   clipped — the description column absorbs the remaining width. */
+.opt-names table th:first-child,
+.opt-names table td:first-child {
+  white-space: nowrap;
+}
