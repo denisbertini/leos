@@ -17,7 +17,7 @@ pub type R<T> = Result<T, String>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
-    EosCp, // EOS console: `eos cp|mkdir|mv|rm|file stat`, paths /eos/<inst>/...
+    EosCp, // EOS console: `eos cp|mkdir|mv|rm|file info`, paths /eos/<inst>/...
     Xrdcp, // xrootd clients: `xrdcp`, `xrdfs`; URLs root://host//path
     Copy,  // local filesystem (test / fake-tier)
 }
@@ -188,7 +188,15 @@ impl Backend {
         match self.kind {
             Kind::Copy => Some(Path::new(path).exists()),
             Kind::EosCp => {
-                let out = self.cmd("eos").args(["file", "stat", path]).output().ok()?;
+                // EOS >= 5.5 replaced `file stat` with `file info`; fall back
+                // to `ls` so directories answer too (info's dir behavior is
+                // build-dependent)
+                if let Ok(o) = self.cmd("eos").args(["file", "info", path]).output() {
+                    if o.status.success() {
+                        return Some(true);
+                    }
+                }
+                let out = self.cmd("eos").args(["ls", path]).output().ok()?;
                 Some(out.status.success())
             }
             Kind::Xrdcp => {
@@ -208,11 +216,17 @@ impl Backend {
         match self.kind {
             Kind::Copy => std::fs::metadata(path).ok().map(|m| m.len()),
             Kind::EosCp => {
-                let o = self.cmd("eos").args(["file", "stat", path]).output().ok()?;
+                // EOS >= 5.5: `eos file info <path> --size`; output format is
+                // build-dependent, so take the first standalone number
+                let o = self
+                    .cmd("eos")
+                    .args(["file", "info", path, "--size"])
+                    .output()
+                    .ok()?;
                 if !o.status.success() {
                     return None;
                 }
-                parse_size(&String::from_utf8_lossy(&o.stdout))
+                parse_first_u64(&String::from_utf8_lossy(&o.stdout))
             }
             Kind::Xrdcp => {
                 let h = self.host.as_deref()?;
@@ -420,6 +434,27 @@ impl Backend {
     }
 }
 
+/// first standalone number in an output line (EOS `file info --size` is
+/// format-variant across builds: bare number, `size: N`, etc.)
+fn parse_first_u64(s: &str) -> Option<u64> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            // reject digits that continue a word (e.g. a fid inside `id=123x45`
+            // is fine to take the first run of; hex/fid confusion avoided by
+            // callers passing --size-only output)
+            return s[start..i].parse().ok();
+        }
+        i += 1;
+    }
+    None
+}
+
 /// tolerate `size=NNN`, `size: NNN`, `size NNN` in stat outputs
 fn parse_size(s: &str) -> Option<u64> {
     let bytes = s.as_bytes();
@@ -480,5 +515,8 @@ mod tests {
         assert_eq!(parse_size("  size : 42 "), Some(42));
         assert_eq!(parse_size("size=abc"), None);
         assert_eq!(parse_size("nothing"), None);
+        assert_eq!(parse_first_u64("2474760192\n"), Some(2474760192));
+        assert_eq!(parse_first_u64("size: 3 bytes"), Some(3));
+        assert_eq!(parse_first_u64("no digits here"), None);
     }
 }
