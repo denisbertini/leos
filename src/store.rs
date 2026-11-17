@@ -273,7 +273,6 @@ fn archive_unit(c: &Cfg, dst: &str, state: &Path, u: &core::Unit) -> R<u64> {
     }
 
     // 3. seal
-    let mut sealed_now = false;
     if c.seal_rename {
         match c.backend.exists(&dst_unit) {
             Some(true) => {
@@ -284,7 +283,6 @@ fn archive_unit(c: &Cfg, dst: &str, state: &Path, u: &core::Unit) -> R<u64> {
             }
             _ => {
                 c.backend.rename(&dst_target, &dst_unit)?;
-                sealed_now = true;
             }
         }
     }
@@ -304,6 +302,10 @@ fn archive_unit(c: &Cfg, dst: &str, state: &Path, u: &core::Unit) -> R<u64> {
     let tmp = state.join(format!("{}.license.tmp", u.name));
     std::fs::write(&tmp, manifest.render()).map_err(|e| e.to_string())?;
     let remote_license = Backend::join(&dst_unit, LICENSE_NAME);
+    // tag honesty: "refreshed" only when a license actually existed before
+    // this upload -- the honest question is store state, not which seal path
+    // ran (marker mode has no rename step to infer a first-seal from)
+    let refreshed = c.backend.exists(&remote_license) == Some(true);
     c.backend.copy_to(&tmp, &remote_license)?;
     if c.backend.size(&remote_license).map(|s| s == 0).unwrap_or(false) {
         return Err("remote license has zero size".to_string());
@@ -318,7 +320,7 @@ fn archive_unit(c: &Cfg, dst: &str, state: &Path, u: &core::Unit) -> R<u64> {
         human_bytes(bytes),
         dt,
         human_bytes(bytes / dt),
-        if sealed_now { "" } else { " [license refreshed]" }
+        if refreshed { " [license refreshed]" } else { "" }
     ));
     Ok(bytes)
 }
