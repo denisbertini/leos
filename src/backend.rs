@@ -49,21 +49,26 @@ pub fn is_remote(path: &str) -> bool {
     path.starts_with("root://") || path.starts_with("/eos/")
 }
 
-fn tail(s: &str, n: usize) -> String {
+fn head(s: &str, n: usize) -> String {
     let t = s.trim();
     if t.is_empty() {
         String::new()
     } else if t.len() <= n {
         format!("stderr: {t}")
     } else {
-        format!("stderr: ...{}", &t[t.len() - n..])
+        let mut end = n;
+        while end > 0 && !t.is_char_boundary(end) {
+            end -= 1; // never slice mid-UTF8
+        }
+        format!("stderr: {}...", &t[..end])
     }
 }
 
 fn err_cmd(what: &str, cmd: &std::process::Output) -> String {
     let code = cmd.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into());
-    format!("{what}: exit={code} {} {}", tail(&String::from_utf8_lossy(&cmd.stderr), 300),
-        tail(&String::from_utf8_lossy(&cmd.stdout), 150))
+    // keep the HEAD of stderr: real complaints come first, progress/warning
+    // summaries last (field lesson: tail-truncation hid the actual error)
+    format!("{what}: exit={code} {}", head(&String::from_utf8_lossy(&cmd.stderr), 400))
 }
 
 impl Backend {
@@ -273,10 +278,13 @@ impl Backend {
                 std::fs::copy(local, remote).map(|_| ()).map_err(|e| e.to_string())
             }
             Kind::EosCp => {
-                // destination carries the token (the documented-working form:
-                // `eos cp <local> "/eos/path?authz=$TOKEN"`); authz on copy
-                // *sources* is what the eos client cannot do.
+                // EOS >= 5.5 clients apply $EOSAUTHZ to the SOURCE argument
+                // as well, corrupting local paths ("/tmp/f?&authz=...") on
+                // uploads. Console copies therefore run WITHOUT the env
+                // token and carry it solely as ?authz= on the destination --
+                // the site-demonstrated form. Metadata ops keep the env.
                 let mut c = self.cmd("eos");
+                c.env_remove("EOSAUTHZ");
                 c.args(["cp", "-n", "--streams"]);
                 c.arg(self.streams.to_string());
                 c.args(&self.extra);
