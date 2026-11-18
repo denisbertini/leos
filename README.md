@@ -12,13 +12,32 @@ a directory is safe to delete when the Lustre quota bites. `leos` adds
 exactly those three answers.
 
 ```
-leos archive <scratch-path>  [--dest <eos-path>] [--dry-run]
+leos archive <scratch-path>  [--dest <eos-path>] [--dry-run] [--claim]
 leos restore <eos-path>      [--dest <scratch-path>]
 leos status  <path>
 leos verify  <path>          [--round-trip]
 leos purge   <scratch-path>  --yes
 leos janitor <scratch-root>
+leos tui     <scratch-path>  [--refresh=SECS]
 ```
+
+## Fleet mode and the dashboard
+
+`--claim` turns any number of data-mover nodes into one drain without
+MPI and without a coordinator: every node races `O_CREAT|O_EXCL` claim
+files in `<path>/.leos/claims` (atomic on the Lustre MDT), archives the
+units it wins, and heartbeats the claim while working. A crashed or
+evicted holder's claim goes stale after 120 s and is stolen by any
+survivor; nodes join and leave freely (`--claim --watch 60`). Sealing
+stays the identical marker chain per unit — coordination never touches
+the integrity contract.
+
+`leos tui` is the read-only window onto all of it: WRITING/READY/
+ARCHIVING/SEALED per unit from the marker chain alone, the live claim
+list as the multi-node worker panel (`owner:beat` per unit), the seal
+ledger from `.leos/records.log`, token validity decoded from the Helios
+JWT, and scratch fill from `statvfs`. It mutates nothing — archive,
+verify and purge deliberately stay CLI, because those have gates.
 
 ## The contract, compactly
 

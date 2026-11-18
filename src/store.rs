@@ -13,6 +13,7 @@
 
 use crate::args::Args;
 use crate::backend::{is_remote, Backend, R};
+use crate::claims::{self, CLAIMS_DIR};
 use crate::core::{
     self, discover, epoch_now, human_bytes, log, parallel, record_append, records_read,
     records_write, walk_unit, Lock, Manifest, INCOMPLETE_SUFFIX, LICENSE_NAME, MARKER_DEFAULT,
@@ -134,7 +135,12 @@ pub fn run_archive(a: &Args) -> R<()> {
     let dst = a.dest()?;
     let c = cfg(a, &dst, 4)?;
     let state = src.join(STATE_DIR);
-    let _lock = Lock::acquire(&state)?;
+    // --claim: peer data-mover nodes share this tree; whole-tree
+    // exclusion would exclude the fleet. Coordination moves to per-unit
+    // O_EXCL claims under .leos/claims (atomic on the Lustre MDT), and
+    // sealing stays the identical marker-chain path per unit.
+    let claims = if a.flag("claim") { Some(state.join(CLAIMS_DIR)) } else { None };
+    let _lock = if claims.is_some() { None } else { Some(Lock::acquire(&state)?) };
     let watch: Option<u64> = match a.opt("watch") {
         Some(s) => Some(s.parse().map_err(|_| "--watch needs seconds".to_string())?),
         None => None,
@@ -159,11 +165,27 @@ pub fn run_archive(a: &Args) -> R<()> {
         }
         let mut left = budget;
         let mut failed = 0usize;
+        let mut peer_claimed = 0usize;
         for u in &pending {
             if left == Some(0) {
                 log("--max-gib budget reached; stopping this pass");
                 break;
             }
+            // fleet mode: win the unit or step aside for whoever holds it
+            let _claim = match &claims {
+                Some(dir) => match claims::Guard::try_acquire(
+                    dir,
+                    &format!("{}.unit", u.name),
+                    claims::STALE_SECS,
+                )? {
+                    Some(g) => Some(g),
+                    None => {
+                        peer_claimed += 1;
+                        continue;
+                    }
+                },
+                None => None,
+            };
             match archive_unit(&c, &dst, &state, u) {
                 Ok(bytes) => {
                     if let Some(b) = left.as_mut() {
@@ -186,6 +208,9 @@ pub fn run_archive(a: &Args) -> R<()> {
                     }
                 }
             }
+        }
+        if peer_claimed > 0 {
+            log(&format!("{peer_claimed} unit(s) held by peer claims (skipped)"));
         }
         match watch {
             Some(secs) => {

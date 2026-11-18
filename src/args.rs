@@ -24,6 +24,7 @@ impl Args {
             "watch",
             "max-gib",
             "older-than-hours",
+            "refresh",
             "token",
         ];
         let mut a =

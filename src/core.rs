@@ -332,50 +332,24 @@ where
 // -------------------------------------------------------------------- lock
 
 pub struct Lock {
-    path: PathBuf,
+    _g: crate::claims::Guard,
 }
 
 impl Lock {
-    /// One archiver per scratch tree: create-exclusive pid lock; a lock whose
-    /// pid no longer exists is stolen (crash recovery).
+    /// One archiver per scratch tree. Historically a bare pid file whose
+    /// liveness was checked in the LOCAL /proc -- wrong on a shared
+    /// Lustre tree, where node B cannot read node A's process table.
+    /// Now a heartbeat claim (claims.rs): same-host dead pid is stolen
+    /// immediately, foreign-host claims are judged by heartbeat age.
     pub fn acquire(state_dir: &Path) -> Result<Lock, String> {
-        std::fs::create_dir_all(state_dir).map_err(|e| e.to_string())?;
-        let path = state_dir.join("lock");
-        for _ in 0..2 {
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(f) => {
-                    use std::io::Write;
-                    (&f)
-                        .write_all(format!("{}\n", std::process::id()).as_bytes())
-                        .map_err(|e| e.to_string())?;
-                    return Ok(Lock { path });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let pid = std::fs::read_to_string(&path)
-                        .ok()
-                        .and_then(|s| s.trim().parse::<u32>().ok());
-                    let alive = pid
-                        .map(|p| Path::new(&format!("/proc/{p}")).exists())
-                        .unwrap_or(false);
-                    if alive {
-                        return Err(format!(
-                            "another leos holds {} (pid {})",
-                            path.display(),
-                            pid.unwrap_or(0)
-                        ));
-                    }
-                    let _ = std::fs::remove_file(&path); // stale
-                }
-                Err(e) => return Err(e.to_string()),
-            }
+        match crate::claims::Guard::try_acquire(state_dir, "lock", crate::claims::STALE_SECS)? {
+            Some(g) => Ok(Lock { _g: g }),
+            None => Err(format!(
+                "another leos holds {} (owner {})",
+                state_dir.join("lock").display(),
+                crate::claims::Guard::owner_of(state_dir, "lock")
+            )),
         }
-        Err(format!("could not take lock {}", path.display()))
-    }
-}
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 

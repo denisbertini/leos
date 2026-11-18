@@ -9,6 +9,14 @@ license = "GPL-3.0-or-later"
 name = "leos"
 path = "src/main.rs"
 
+[dependencies]
+# the ONLY exception to the zero-dependency rule, and a deliberate one:
+# ratatui (with its crossterm re-export) for `leos tui`, and libc purely
+# for statvfs. Both are pure Rust + syscalls: the static musl build is
+# unaffected in kind, only a few hundred KB larger.
+ratatui = "0.29"
+libc = "0.2"
+
 [profile.release]
 lto = true
 strip = true

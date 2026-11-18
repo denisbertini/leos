@@ -8,18 +8,24 @@
 //!   leos verify  <path>            # checksum / round-trip check
 //!   leos purge   <lustre-path> --yes
 //!   leos janitor <lustre-root>
+//!   leos tui     <lustre-path> [--refresh=SECS]   # read-only dashboard
 //!
-//! Zero dependencies by design. The EOS wire is subprocesses (`eos cp` /
-//! `xrdcp` / `xrdfs`), so site authentication stays with the tools that
-//! already work. Integrity = a manifest of per-file sizes and content
-//! adler32, uploaded as `.archived` LAST: the license, and the deletion
+//! Dependencies: none for the data path -- the EOS wire is subprocesses
+//! (`eos cp` / `xrdcp` / `xrdfs`), so site authentication stays with the
+//! tools that already work. The single exception is the `tui` module's
+//! ratatui/libc, which change nothing about the binary's portability:
+//! pure Rust, static musl build unaffected.
+//! Integrity = a manifest of per-file sizes and content adler32,
+//! uploaded as `.archived` LAST: the license, and the deletion
 //! license. Build: `cargo build --release`, or static with the musl target.
 
 mod adler32;
 mod args;
 mod backend;
+mod claims;
 mod core;
 mod store;
+mod tui;
 
 use args::Args;
 
@@ -33,6 +39,7 @@ usage:
   leos verify  <path>        [--dest <eos-path>] [--round-trip] [--remote]
   leos purge   <lustre-path> --yes
   leos janitor <lustre-root> [--older-than-hours N] [--dry-run]
+  leos tui     <lustre-path> [--dest <eos-path>] [--refresh=SECS]
 
 <path> may be a single checkpoint (a directory containing the completion
 marker, default bbstage.final) or a tree to scan for them. --dest may also
@@ -56,6 +63,18 @@ how it works
   purge    deletes local trees that hold a license verifying against the
            tree AND whose license exists on the store. This is the ONLY
            supported way to reclaim scratch.
+  tui      read-only live dashboard: WRITING/READY/ARCHIVING/SEALED per
+           unit from the marker chain, live multi-node claims, seal
+           ledger, token validity, scratch fill. q quit, r refresh,
+           p pause. Mutates nothing.
+
+multi-node archive (no MPI, no coordinator):
+  run `leos archive --claim` on any number of data-mover nodes over the
+  same <lustre-path>: each node claims whole units via O_CREAT|O_EXCL
+  files in <path>/.leos/claims (atomic on the Lustre MDT), archives what
+  it won, heartbeats while working. A crashed holder's claim is stolen
+  after 120 s by any survivor; nodes join and leave freely (add --watch
+  to keep draining). Sealing stays the unchanged marker-chain path.
 
 transfer options (archive/restore):
   --streams=N   per-file xrootd/eos streams    (default 4 archive, 8 restore)
@@ -114,6 +133,7 @@ fn main() {
         "verify" => store::run_verify(&a),
         "purge" => store::run_purge(&a),
         "janitor" => store::run_janitor(&a),
+        "tui" => tui::run(&a),
         other => {
             eprintln!("leos: unknown command '{other}' (see --help)");
             std::process::exit(2);
