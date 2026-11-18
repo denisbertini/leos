@@ -293,10 +293,11 @@ fn statvfs_used(path: &Path) -> Option<String> {
     }
     let used = total - avail;
     Some(format!(
-        "{}% ({:.1} / {:.1} TB)",
+        "{}% used ({} of {}, {} free)",
         (used * 100) / total,
-        used as f64 / 1e12,
-        total as f64 / 1e12
+        human_bytes(used),
+        human_bytes(total),
+        human_bytes(avail)
     ))
 }
 
@@ -459,7 +460,7 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
                 format!(" {unit:<20} {:<16} {age:>3}s silent  ABANDONED", c.owner())
             } else {
                 let pct = if c.total > 0 {
-                    format!("{:>3}%", (c.done * 100) / c.total)
+                    format!("{:>3}%", (c.done.min(c.total) * 100) / c.total)
                 } else {
                     "  ...".to_string()
                 };
@@ -475,8 +476,11 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
                 head,
                 Style::default().fg(if stale { Color::Red } else { Color::Cyan }),
             )));
-            let frac =
-                if stale || c.total == 0 { 0.0 } else { c.done as f64 / c.total as f64 };
+            let frac = if stale || c.total == 0 {
+                0.0
+            } else {
+                c.done.min(c.total) as f64 / c.total as f64
+            };
             lines.push(Line::from(braille_bar(frac, barw, stale)));
         }
         let title = if s.aggregate > 1.0 {
