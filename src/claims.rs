@@ -9,6 +9,11 @@
 //!     the losers get AlreadyExists and move on.
 //!   * A heartbeat thread rewrites the file (mtime + fresh epoch) every
 //!     HEARTBEAT_SECS while the guard is alive.
+//!   * `progress()` extends the payload to `host:pid:epoch:done:total`
+//!     as payload files complete: the claim file doubles as the
+//!     worker's byte ledger, which `leos tui` renders as a braille
+//!     progress bar and derives rates from between scans. No protocol,
+//!     no polling of the workers -- Lustre is the message bus.
 //!   * A claim is stealable when its heartbeat is older than `stale`
 //!     seconds, or when it names a pid on THIS host that no longer
 //!     exists (same-node crash: provable death, no waiting). A claim on
@@ -17,9 +22,6 @@
 //!     shared-tree lock was checked against the local /proc only.
 //!   * Dropping the guard removes the claim (clean release) so the
 //!     queue drains; a dead holder's file stays and is reaped+retried.
-//!
-//! Claim files double as the cluster feed for `leos tui`: every live
-//! claim names its owner and last beat, no extra protocol needed.
 
 use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::Write;
@@ -43,12 +45,42 @@ pub fn host() -> String {
         .unwrap_or_else(|_| "unknown".into())
 }
 
-fn owner_line() -> String {
-    format!("{}:{}:{}", host(), std::process::id(), epoch_now())
-}
-
 fn epoch_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+#[derive(Debug, Clone)]
+pub struct Claim {
+    pub host: String,
+    pub pid: u32,
+    pub epoch: u64,
+    pub done: u64,
+    pub total: u64,
+}
+
+impl Claim {
+    /// Owner label for humans: host:pid
+    pub fn owner(&self) -> String {
+        format!("{}:{}", self.host, self.pid)
+    }
+    fn render(&self) -> String {
+        if self.total > 0 {
+            format!("{}:{}:{}:{}:{}", self.host, self.pid, self.epoch, self.done, self.total)
+        } else {
+            format!("{}:{}:{}", self.host, self.pid, self.epoch)
+        }
+    }
+}
+
+/// Parse `host:pid:epoch[:done:total]`; None for foreign/legacy formats.
+fn parse_claim(text: &str) -> Option<Claim> {
+    let mut it = text.trim().split(':');
+    let host = it.next()?.to_string();
+    let pid = it.next()?.parse().ok()?;
+    let epoch = it.next().unwrap_or("0").parse().unwrap_or(0);
+    let done = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let total = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    Some(Claim { host, pid, epoch, done, total })
 }
 
 fn mtime_age(path: &Path) -> Option<u64> {
@@ -59,22 +91,12 @@ fn mtime_age(path: &Path) -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
-/// Parse `host:pid:epoch`; None for foreign/legacy formats (mtime rule
-/// then applies alone).
-fn parse_owner(text: &str) -> Option<(String, u32, u64)> {
-    let mut it = text.trim().split(':');
-    let h = it.next()?.to_string();
-    let p = it.next()?.parse().ok()?;
-    let e = it.next().unwrap_or("0").parse().unwrap_or(0);
-    Some((h, p, e))
-}
-
 fn is_stale(path: &Path, stale: u64) -> bool {
     // provably dead on this node: immediate steal, do not wait out the
     // heartbeat window (Slurm-killed leader case)
     if let Ok(text) = fs::read_to_string(path) {
-        if let Some((h, pid, _)) = parse_owner(text.trim()) {
-            if h == host() && !Path::new(&format!("/proc/{pid}")).exists() {
+        if let Some(c) = parse_claim(text.trim()) {
+            if c.host == host() && !Path::new(&format!("/proc/{}", c.pid)).exists() {
                 return true;
             }
         }
@@ -86,7 +108,13 @@ pub struct Guard {
     path: PathBuf,
     stop: Arc<AtomicBool>,
     hb: Option<thread::JoinHandle<()>>,
+    claim: Arc<MutexClaim>,
 }
+
+/// Interior-mutable claim payload shared by the owner thread (progress
+/// updates on file completion) and the heartbeat thread (rewrite loop).
+struct MutexClaim(std::sync::Mutex<Claim>);
+unsafe impl Sync for MutexClaim {} // payload is a POD struct behind a Mutex
 
 impl Guard {
     /// Claim `name` in `dir`; Ok(None) = a live claim is held elsewhere.
@@ -97,11 +125,18 @@ impl Guard {
         let path = dir.join(name);
         for attempt in 0..2 {
             match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(f) => {
-                    Self::beat(&f);
+                Ok(mut f) => {
+                    let claim = Arc::new(MutexClaim(std::sync::Mutex::new(Claim {
+                        host: host(),
+                        pid: std::process::id(),
+                        epoch: epoch_now(),
+                        done: 0,
+                        total: 0,
+                    })));
+                    beat(&mut f, &claim);
                     let stop = Arc::new(AtomicBool::new(false));
                     let hb = {
-                        let (stop, p) = (Arc::clone(&stop), path.clone());
+                        let (stop, p, claim) = (Arc::clone(&stop), path.clone(), Arc::clone(&claim));
                         thread::spawn(move || {
                             // 500ms ticks so Drop::join is never a 30 s wait
                             let mut since = Duration::ZERO;
@@ -111,18 +146,18 @@ impl Guard {
                                 since += step;
                                 if since >= Duration::from_secs(HEARTBEAT_SECS) {
                                     since = Duration::ZERO;
-                                    if let Ok(f) = fs::OpenOptions::new()
+                                    if let Ok(mut f) = OpenOptions::new()
                                         .write(true)
                                         .truncate(true)
                                         .open(&p)
                                     {
-                                        Self::beat(&f);
+                                        beat(&mut f, &claim);
                                     }
                                 }
                             }
                         })
                     };
-                    return Ok(Some(Guard { path, stop, hb: Some(hb) }));
+                    return Ok(Some(Guard { path, stop, hb: Some(hb), claim }));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     if attempt == 0 && is_stale(&path, stale) {
@@ -137,21 +172,26 @@ impl Guard {
         Ok(None)
     }
 
+    /// Publish byte progress (files copied vs unit total). Called on
+    /// every payload-file completion: a few dozen small Lustre writes
+    /// per unit, invisible next to the GiB-scale copies they follow.
+    pub fn progress(&self, done: u64, total: u64) {
+        {
+            let mut c = self.claim.0.lock().unwrap();
+            c.done = done;
+            c.total = total;
+            c.epoch = epoch_now();
+        }
+        if let Ok(mut f) = OpenOptions::new().write(true).truncate(true).open(&self.path) {
+            beat(&mut f, &self.claim);
+        }
+    }
+
     /// Who holds this claim (for error messages and the TUI).
     pub fn owner_of(dir: &Path, name: &str) -> String {
         fs::read_to_string(dir.join(name))
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| "?".into())
-    }
-
-    /// mtime + content refresh, cache-coherent proof of liveness: the
-    /// 8-byte rewrite cannot be served from our page cache alone on
-    /// Lustre's MDT path, same argument as bbstage's probe sentinel.
-    fn beat(mut f: &File) {
-        // &File implements Write: mut-binding of the *reference* enables it
-        let _ = f.write_all(owner_line().as_bytes());
-        let _ = f.sync_all();
-        let _ = f.set_times(FileTimes::new().set_modified(SystemTime::now()));
     }
 }
 
@@ -165,9 +205,19 @@ impl Drop for Guard {
     }
 }
 
-/// All claims in `dir`, newest beat first: (claim name, owner, age s).
-/// `age > stale` entries are abandoned-but-unreaped, render them red.
-pub fn live(dir: &Path, stale: u64) -> Vec<(String, String, u64)> {
+/// mtime + content refresh: the rewrite cannot be served from our page
+/// cache alone on Lustre's MDT path -- same argument as bbstage's probe
+/// sentinel, so a fresh mtime is genuine evidence of a live holder.
+fn beat(f: &mut File, claim: &MutexClaim) {
+    let text = claim.0.lock().unwrap().render();
+    let _ = f.write_all(text.as_bytes());
+    let _ = f.sync_all();
+    let _ = f.set_times(FileTimes::new().set_modified(SystemTime::now()));
+}
+
+/// All claims in `dir`, newest beat first.
+/// age > STALE_SECS entries are abandoned-but-unreaped, render red.
+pub fn live(dir: &Path, stale: u64) -> Vec<(String, Claim, u64)> {
     let mut out = Vec::new();
     let rd = match fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -178,11 +228,12 @@ pub fn live(dir: &Path, stale: u64) -> Vec<(String, String, u64)> {
         if name.starts_with('.') {
             continue;
         }
-        let owner = fs::read_to_string(ent.path())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| "?".into());
+        let claim = fs::read_to_string(ent.path())
+            .ok()
+            .and_then(|s| parse_claim(&s))
+            .unwrap_or(Claim { host: "?".into(), pid: 0, epoch: 0, done: 0, total: 0 });
         let age = mtime_age(&ent.path()).unwrap_or(stale + 1);
-        out.push((name, owner, age));
+        out.push((name, claim, age));
     }
     out.sort_by_key(|(_, _, age)| *age);
     out
@@ -245,10 +296,28 @@ mod tests {
         let v = live(&d, STALE_SECS);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].0, "openpmd_100.unit");
-        assert!(v[0].1.starts_with(&host()));
+        assert_eq!(v[0].1.host, host());
         assert!(v[0].2 <= 2);
         drop(g);
         assert!(live(&d, STALE_SECS).is_empty());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn progress_roundtrips_through_the_claim_file() {
+        let d = tmpdir("progress");
+        let g = Guard::try_acquire(&d, "openpmd_200.unit", STALE_SECS).unwrap().unwrap();
+        g.progress(3 * (1 << 30), 8 * (1 << 30));
+        let (name, c, age) = &live(&d, STALE_SECS)[0];
+        assert_eq!(name, "openpmd_200.unit");
+        assert_eq!(c.done, 3 << 30);
+        assert_eq!(c.total, 8 << 30);
+        assert!(*age <= 2);
+        // legacy 3-field claims must still parse (no progress, no panic)
+        fs::write(d.join("openpmd_200.unit"), "n:1:2").unwrap();
+        let (_, c, _) = &live(&d, STALE_SECS)[0];
+        assert_eq!((c.done, c.total), (0, 0));
+        drop(g);
         let _ = fs::remove_dir_all(&d);
     }
 }

@@ -172,7 +172,7 @@ pub fn run_archive(a: &Args) -> R<()> {
                 break;
             }
             // fleet mode: win the unit or step aside for whoever holds it
-            let _claim = match &claims {
+            let claim_g = match &claims {
                 Some(dir) => match claims::Guard::try_acquire(
                     dir,
                     &format!("{}.unit", u.name),
@@ -186,7 +186,7 @@ pub fn run_archive(a: &Args) -> R<()> {
                 },
                 None => None,
             };
-            match archive_unit(&c, &dst, &state, u) {
+            match archive_unit(&c, &dst, &state, u, claim_g.as_ref()) {
                 Ok(bytes) => {
                     if let Some(b) = left.as_mut() {
                         *b = b.saturating_sub(bytes);
@@ -230,7 +230,13 @@ pub fn run_archive(a: &Args) -> R<()> {
     }
 }
 
-fn archive_unit(c: &Cfg, dst: &str, state: &Path, u: &core::Unit) -> R<u64> {
+fn archive_unit(
+    c: &Cfg,
+    dst: &str,
+    state: &Path,
+    u: &core::Unit,
+    claim: Option<&claims::Guard>,
+) -> R<u64> {
     let t0 = epoch_now();
     // dry-run plans with metadata only: sizes and file lists, no hashing
     let hash_now = c.hash && !c.dry;
@@ -276,8 +282,15 @@ fn archive_unit(c: &Cfg, dst: &str, state: &Path, u: &core::Unit) -> R<u64> {
         .collect();
     let b = c.backend.clone();
     let allow_unverified = c.allow_unverified;
+    // fleet progress: each completed payload file publishes its running
+    // byte count into our claim file -> the TUI bar (zero protocol)
+    if let Some(g) = claim {
+        g.progress(0, bytes);
+    }
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let results = parallel(work, c.jobs, |_i, (local, remote, want)| {
-        b.copy_to(&local, &remote)
+        let r = b
+            .copy_to(&local, &remote)
             .and_then(|()| match b.size(&remote) {
                 Some(g) if g == want => Ok(()),
                 Some(g) => Err(format!("size mismatch remote {remote}: {g} != {want}")),
@@ -291,7 +304,14 @@ fn archive_unit(c: &Cfg, dst: &str, state: &Path, u: &core::Unit) -> R<u64> {
                         ))
                     }
                 }
-            })
+            });
+        if r.is_ok() {
+            let d = done.fetch_add(want, std::sync::atomic::Ordering::Relaxed) + want;
+            if let Some(g) = claim {
+                g.progress(d, bytes);
+            }
+        }
+        r
     });
     if let Some(e) = results.into_iter().find_map(|r| r.err()) {
         return Err(format!("copy stage failed (left {} for janitor/retry): {e}", dst_target));
