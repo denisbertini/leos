@@ -23,7 +23,7 @@ use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Gauge, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Cell, Gauge, Paragraph, Row, Sparkline, Table};
 use ratatui::Frame;
 
 use crate::args::Args;
@@ -34,6 +34,17 @@ use crate::core::{
 };
 
 type R<T> = Result<T, String>;
+
+// Fixed 24-bit palette: immune to site palette remaps (observed: ANSI
+// "green" rendered yellow, "cyan" rendered green). Truecolor passes
+// through any honest terminal emulator unchanged.
+const LIGHT_BLUE: Color = Color::Rgb(95, 175, 255); // gauge fill, WRITING
+const CYAN: Color = Color::Rgb(0, 215, 215);        // ARCHIVING, owners
+const YELLOW: Color = Color::Rgb(255, 215, 95);     // READY
+const GREEN: Color = Color::Rgb(95, 215, 135);      // SEALED, sparkline
+const RED: Color = Color::Rgb(255, 95, 95);         // errors, abandoned
+const DIM: Color = Color::Rgb(120, 120, 120);       // secondary text
+const INK: Color = Color::Rgb(10, 10, 10);          // knockout label ink
 
 // ----------------------------------------------------------------- model
 
@@ -56,10 +67,10 @@ impl State {
     }
     fn color(self) -> Color {
         match self {
-            State::Writing => Color::Blue,
-            State::Ready => Color::Yellow,
-            State::Archiving => Color::Cyan,
-            State::Sealed => Color::Green,
+            State::Writing => LIGHT_BLUE,
+            State::Ready => YELLOW,
+            State::Archiving => CYAN,
+            State::Sealed => GREEN,
         }
     }
 }
@@ -81,6 +92,7 @@ struct Snapshot {
     claims: Vec<(String, claims::Claim, u64)>, // (name, payload, beat age s)
     rates: Vec<(String, f64)>, // GiB-accurate bytes/s, derived scan-to-scan
     aggregate: f64,            // sum of the above
+    history: VecDeque<f64>,    // aggregate GiB/s per scan, live series
     ledger: VecDeque<String>, // seal-ledger lines, newest first
     scan_ms: u64,
     error: Option<String>,
@@ -166,6 +178,7 @@ fn scan(root: &Path, marker: &str, dest: Option<String>) -> Snapshot {
         claims,
         rates: Vec::new(),
         aggregate: 0.0,
+        history: VecDeque::new(),
         ledger,
         scan_ms: t0.elapsed().as_millis() as u64,
         error,
@@ -318,8 +331,8 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
         Span::styled(
             format!(" leos v{} ", env!("CARGO_PKG_VERSION")),
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(INK)
+                .bg(CYAN)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(" scan {}ms", s.scan_ms)),
@@ -333,7 +346,7 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
         hdr.push(Span::styled(
             t.clone(),
             Style::default()
-                .fg(if bad { Color::Red } else { Color::Green })
+                .fg(if bad { RED } else { GREEN })
                 .add_modifier(if bad { Modifier::BOLD } else { Modifier::empty() }),
         ));
     }
@@ -402,6 +415,9 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
         let mut c = vec![Constraint::Length(5)];
         if !s.claims.is_empty() {
             c.push(Constraint::Length(s.claims.len().min(8) as u16 * 2 + 2));
+            if !s.history.is_empty() {
+                c.push(Constraint::Length(9));
+            }
         }
         c.push(Constraint::Min(3));
         c
@@ -425,23 +441,23 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
     }
     let pipe = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled(" writing ", Style::default().fg(Color::Blue)),
+            Span::styled(" writing ", Style::default().fg(LIGHT_BLUE)),
             Span::raw(format!("{} units   ", cnt[0])),
-            Span::styled(" ready ", Style::default().fg(Color::Yellow)),
+            Span::styled(" ready ", Style::default().fg(YELLOW)),
             Span::raw(format!("{} units / {}", cnt[1], human_bytes(tot[1]))),
         ]),
         Line::from(vec![
-            Span::styled(" archiving ", Style::default().fg(Color::Cyan)),
+            Span::styled(" archiving ", Style::default().fg(CYAN)),
             Span::raw(format!("{} units / {}   ", cnt[2], human_bytes(tot[2]))),
-            Span::styled(" sealed ", Style::default().fg(Color::Green)),
+            Span::styled(" sealed ", Style::default().fg(GREEN)),
             Span::raw(format!("{} units / {}", cnt[3], human_bytes(tot[3]))),
         ]),
         Line::from(if let Some(e) = &s.error {
-            Span::styled(e.clone(), Style::default().fg(Color::Red))
+            Span::styled(e.clone(), Style::default().fg(RED))
         } else {
             Span::styled(
                 " state read from markers only -- this view never mutates data",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(DIM),
             )
         }),
     ])
@@ -491,7 +507,7 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     head,
-                    Style::default().fg(if stale { Color::Red } else { Color::Cyan }),
+                    Style::default().fg(if stale { RED } else { CYAN }),
                 ))),
                 rows[i * 2],
             );
@@ -507,11 +523,7 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
             let gauge = Gauge::default()
                 .ratio(frac)
                 .use_unicode(true)
-                .gauge_style(Style::default().fg(if stale {
-                    Color::Red
-                } else {
-                    Color::Cyan
-                }).bg(Color::Black))
+                .gauge_style(Style::default().fg(if stale { RED } else { LIGHT_BLUE }).bg(INK))
                 .label(if stale {
                     format!("ABANDONED {age}s silent")
                 } else if c.total > 0 {
@@ -523,15 +535,40 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
         }
     }
 
+    // live time series of the fleet aggregate: samples are the same
+    // scan-to-scan deltas, accumulated in the driver; Sparkline renders
+    // braille-resolution dots over a fixed 240-sample window (~12 min
+    // at the default 3 s refresh)
+    if right.len() >= 3 && !s.history.is_empty() {
+        let peak = s.history.iter().fold(0.0f64, |a, &v| a.max(v));
+        let cur = *s.history.back().unwrap_or(&0.0);
+        // Sparkline bars are u64 in 0.29 (quantize to 0.1 GiB/s steps)
+        // and render the FIRST width samples: build an exactly-right-
+        // aligned window so the series grows from the left and scrolls
+        let w = (right[2].width as usize).saturating_sub(2);
+        let mut data: Vec<u64> = Vec::with_capacity(w);
+        let shown = s.history.len().min(w);
+        data.resize(w - shown, 0);
+        data.extend(s.history.iter().skip(s.history.len() - shown).map(|v| (v * 10.0).round() as u64));
+        let spark = Sparkline::default()
+            .data(data)
+            .style(Style::default().fg(GREEN))
+            .block(Block::bordered().title(format!(
+                " Aggregate EOS Throughput: {:.2} GiB/s (peak: {:.2}) ",
+                cur, peak
+            )));
+        f.render_widget(spark, right[2]);
+    }
+
     let ledger_panel = right.len() - 1;
     let ledger: Vec<Line> = s
         .ledger
         .iter()
         .map(|l| {
             let col = if l.contains("SEALED") {
-                Color::Green
+                GREEN
             } else {
-                Color::DarkGray
+                DIM
             };
             Line::from(Span::styled(l.clone(), Style::default().fg(col)))
         })
@@ -554,7 +591,7 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
         )
     };
     f.render_widget(
-        Paragraph::new(Span::styled(foot, Style::default().bg(Color::DarkGray))),
+        Paragraph::new(Span::styled(foot, Style::default().bg(DIM))),
         lines[2],
     );
 }
@@ -603,6 +640,7 @@ pub fn run(a: &Args) -> R<()> {
         claims: Vec::new(),
         rates: Vec::new(),
         aggregate: 0.0,
+        history: VecDeque::new(),
         ledger: VecDeque::new(),
         scan_ms: 0,
         error: Some("scanning...".into()),
@@ -613,6 +651,7 @@ pub fn run(a: &Args) -> R<()> {
         let mut paused = false;
         let mut inflight = false;
         let mut prev: HashMap<String, (u64, Instant)> = HashMap::new();
+        let mut hist: VecDeque<f64> = VecDeque::new();
         let mut last_scan = Instant::now() - Duration::from_secs(scan_period);
         loop {
             if !paused && !inflight && last_scan.elapsed() >= Duration::from_secs(scan_period) {
@@ -643,6 +682,11 @@ pub fn run(a: &Args) -> R<()> {
                 prev.retain(|n, _| s.claims.iter().any(|(cn, _, _)| cn == n));
                 s.rates = rates;
                 s.aggregate = agg;
+                hist.push_back(agg / (1u64 << 30) as f64);
+                while hist.len() > 240 {
+                    hist.pop_front();
+                }
+                s.history = hist.clone();
                 snapshot = s;
                 inflight = false;
             }
