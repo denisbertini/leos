@@ -178,7 +178,9 @@ impl Guard {
     pub fn progress(&self, done: u64, total: u64) {
         {
             let mut c = self.claim.0.lock().unwrap();
-            c.done = done;
+            // monotonic: file-completion and the destination-size
+            // monitor both publish; the claim only ever moves forward
+            c.done = c.done.max(done);
             c.total = total;
             c.epoch = epoch_now();
         }

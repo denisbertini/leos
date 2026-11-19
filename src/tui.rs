@@ -503,7 +503,14 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
                 .find(|(n, _)| n == unit)
                 .map(|(_, r)| format!("{:.1} GiB/s", r / (1u64 << 30) as f64))
                 .unwrap_or_else(|| "-".to_string());
-            let head = format!(" {short:<22} owner {:<18} {rate}", c.owner());
+            let state = if stale {
+                format!("{age}s ABANDONED")
+            } else if c.total > 0 {
+                format!("{:>3}%", (c.done.min(c.total) * 100) / c.total)
+            } else {
+                " ... ".to_string()
+            };
+            let head = format!(" {short:<20} {:<16} {state} {rate}", c.owner());
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     head,
@@ -523,14 +530,11 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
             let gauge = Gauge::default()
                 .ratio(frac)
                 .use_unicode(true)
-                .gauge_style(Style::default().fg(if stale { RED } else { LIGHT_BLUE }).bg(INK))
-                .label(if stale {
-                    format!("ABANDONED {age}s silent")
-                } else if c.total > 0 {
-                    format!("{}%", (c.done.min(c.total) * 100) / c.total)
-                } else {
-                    "planning".to_string()
-                });
+                // no center label and no bg ink: the bar sits on the
+                // terminal's own background (the ink band was ugly);
+                // the percentage lives on the owner row above
+                .gauge_style(Style::default().fg(if stale { RED } else { LIGHT_BLUE }))
+                .label("");
             f.render_widget(gauge, rows[i * 2 + 1]);
         }
     }
@@ -550,7 +554,10 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
         let shown = s.history.len().min(w);
         data.resize(w - shown, 0);
         data.extend(s.history.iter().skip(s.history.len() - shown).map(|v| (v * 10.0).round() as u64));
+        // explicit axis max keeps a steady rate as a level line with
+        // headroom, instead of ratatui's auto-max pinning it full-height
         let spark = Sparkline::default()
+            .max(((peak * 10.0) * 1.3).ceil().max(4.0) as u64)
             .data(data)
             .style(Style::default().fg(GREEN))
             .block(Block::bordered().title(format!(

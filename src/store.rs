@@ -288,7 +288,34 @@ fn archive_unit(
         g.progress(0, bytes);
     }
     let done = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let results = parallel(work, c.jobs, |_i, (local, remote, want)| {
+    // intra-file liveness: file-completion alone is too coarse for a
+    // 146 GiB data.0, so while copies run, a poller adds the bytes
+    // already visible at the destinations (local stat, or store stat
+    // where the FS reports open-file growth). Purely opportunistic:
+    // completion accounting above remains the authority; the claim
+    // takes the max of both views.
+    let stop_mon = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let results = std::thread::scope(|scope| {
+        let mon = claim.map(|g| {
+            let (b2, work2, stop2, total) = (
+                    b.clone(),
+                    work.clone(),
+                    std::sync::Arc::clone(&stop_mon),
+                    bytes,
+                );
+            scope.spawn(move || loop {
+                if stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let seen: u64 = work2
+                    .iter()
+                    .map(|(_, remote, want)| b2.size(remote).unwrap_or(0).min(*want))
+                    .sum();
+                g.progress(seen, total);
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            })
+        });
+        let res = parallel(work, c.jobs, |_i, (local, remote, want)| {
         let r = b
             .copy_to(&local, &remote)
             .and_then(|()| match b.size(&remote) {
@@ -312,6 +339,12 @@ fn archive_unit(
             }
         }
         r
+        });
+        stop_mon.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = mon {
+            let _ = h.join();
+        }
+        res
     });
     if let Some(e) = results.into_iter().find_map(|r| r.err()) {
         return Err(format!("copy stage failed (left {} for janitor/retry): {e}", dst_target));
