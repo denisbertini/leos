@@ -23,7 +23,7 @@ use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Paragraph, Row, Sparkline, Table};
+use ratatui::widgets::{Block, Cell, Gauge, Paragraph, Row, Sparkline, Table};
 use ratatui::Frame;
 
 use crate::args::Args;
@@ -514,46 +514,25 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
                 ))),
                 rows[i * 2],
             );
-            // Custom text bar: no Gauge widget, no label overlay, no
-            // background style ANYWHERE -- there is no surface left for
-            // a palette-remapping terminal to paint a black square on.
-            // Solid blocks fill, faint blocks show the remainder, and
-            // the percentage is bold plain text at the right edge.
-            let bar = rows[i * 2 + 1];
-            let pct = if stale {
-                "ABANDONED".to_string()
-            } else if c.total > 0 {
-                format!("{}%", (c.done.min(c.total) * 100) / c.total)
+            // Stock ratatui Gauge, exactly the official example: the
+            // widget centers its own label (default label IS the
+            // percentage), and where the fill crosses the label it
+            // swaps fg/bg itself. With only fg set and NO bg in
+            // gauge_style, the swap uses the terminal's default ink on
+            // the light-blue fill: readable everywhere, no painted
+            // black anything.
+            let gauge = Gauge::default()
+                .ratio(frac)
+                .use_unicode(true)
+                .gauge_style(Style::default().fg(if stale { RED } else { LIGHT_BLUE }));
+            let gauge = if stale {
+                gauge.label("ABANDONED")
+            } else if c.total == 0 {
+                gauge.label("planning")
             } else {
-                "planning".to_string()
+                gauge // official default: "NN%" centered
             };
-            let col = if stale { RED } else { LIGHT_BLUE };
-            let inner = (bar.width as usize)
-                .saturating_sub(pct.chars().count() + 2)
-                .max(1);
-            // work in eighths of a cell (same resolution ratatui's
-            // Gauge uses internally): exact math, no float drift
-            const PARTS: [&str; 7] = [
-                "\u{258F}", "\u{258E}", "\u{258D}", "\u{258C}",
-                "\u{258B}", "\u{258A}", "\u{2589}",
-            ];
-            let eighths = (frac * inner as f64 * 8.0).round() as usize;
-            let full = (eighths / 8).min(inner);
-            let rem = if full < inner { eighths % 8 } else { 0 };
-            let mut fill = "\u{2588}".repeat(full);
-            if rem > 0 {
-                fill.push_str(PARTS[rem - 1]);
-            }
-            let empty = "\u{2591}".repeat(inner - fill.chars().count());
-            let line = Line::from(vec![
-                Span::styled(fill, Style::default().fg(col)),
-                Span::styled(empty, Style::default().fg(DIM)),
-                Span::styled(
-                    format!(" {pct}"),
-                    Style::default().fg(col).add_modifier(Modifier::BOLD),
-                ),
-            ]);
-            f.render_widget(Paragraph::new(line), bar);
+            f.render_widget(gauge, rows[i * 2 + 1]);
         }
     }
 
