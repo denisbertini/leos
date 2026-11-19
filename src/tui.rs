@@ -23,7 +23,7 @@ use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Cell, Gauge, Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::args::Args;
@@ -448,49 +448,74 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
     .block(Block::bordered().title(" PIPELINE "));
     f.render_widget(pipe, right[0]);
 
-    // fleet view: every live claim is a worker working on a unit right now
-    let ledger_panel = right.len() - 1;
+
+    // fleet view: per worker one label line and one Gauge widget,
+    // ratatui gauge-example style (unicode fractional blocks, the
+    // percentage centered on the bar)
     if !s.claims.is_empty() {
-        let barw = (cols[1].width as usize).saturating_sub(4);
-        let mut lines: Vec<Line> = Vec::new();
-        for (unit, c, age) in s.claims.iter().take(8) {
-            let stale = *age > STALE_SECS;
-            let unit = unit.trim_end_matches(".unit");
-            let head = if stale {
-                format!(" {unit:<20} {:<16} {age:>3}s silent  ABANDONED", c.owner())
-            } else {
-                let pct = if c.total > 0 {
-                    format!("{:>3}%", (c.done.min(c.total) * 100) / c.total)
-                } else {
-                    "  ...".to_string()
-                };
-                let rate = s
-                    .rates
-                    .iter()
-                    .find(|(n, _)| n == unit)
-                    .map(|(_, r)| format!(" {:.1}G/s", r / (1u64 << 30) as f64))
-                    .unwrap_or_default();
-                format!(" {unit:<20} {:<16} {pct}{rate}", c.owner())
-            };
-            lines.push(Line::from(Span::styled(
-                head,
-                Style::default().fg(if stale { Color::Red } else { Color::Cyan }),
-            )));
-            let frac = if stale || c.total == 0 {
-                0.0
-            } else {
-                c.done.min(c.total) as f64 / c.total as f64
-            };
-            lines.push(Line::from(braille_bar(frac, barw, stale)));
-        }
+        let shown: Vec<&(String, claims::Claim, u64)> = s.claims.iter().take(8).collect();
         let title = if s.aggregate > 1.0 {
             format!(" MULTI-NODE WORKERS - {:.2} GiB/s aggregate ", s.aggregate / (1u64 << 30) as f64)
         } else {
             " MULTI-NODE WORKERS (.leos/claims, O_EXCL on Lustre) ".to_string()
         };
-        f.render_widget(Paragraph::new(lines).block(Block::bordered().title(title)), right[1]);
+        let block = Block::bordered().title(title);
+        let inner = block.inner(right[1]);
+        f.render_widget(block, right[1]);
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(
+                shown
+                    .iter()
+                    .flat_map(|_| [Constraint::Length(1), Constraint::Length(1)])
+                    .collect::<Vec<Constraint>>(),
+            )
+            .split(inner);
+        for (i, (unit, c, age)) in shown.iter().enumerate() {
+            let stale = *age > STALE_SECS;
+            let short = unit.trim_end_matches(".unit");
+            let frac = if stale || c.total == 0 {
+                0.0
+            } else {
+                c.done.min(c.total) as f64 / c.total as f64
+            };
+            // owner line: rate derived scan-to-scan from the worker's
+            // byte ledger, never transmitted
+            let rate = s
+                .rates
+                .iter()
+                .find(|(n, _)| n == unit)
+                .map(|(_, r)| format!("{:.1} GiB/s", r / (1u64 << 30) as f64))
+                .unwrap_or_else(|| "-".to_string());
+            let head = format!(" {short:<22} owner {:<18} {rate}", c.owner());
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    head,
+                    Style::default().fg(if stale { Color::Red } else { Color::Cyan }),
+                ))),
+                rows[i * 2],
+            );
+            let gauge = Gauge::default()
+                .ratio(frac)
+                .use_unicode(true)
+                .style(Style::default().fg(Color::DarkGray))
+                .gauge_style(Style::default().fg(if stale {
+                    Color::Red
+                } else {
+                    Color::Green
+                }))
+                .label(if stale {
+                    format!("ABANDONED {age}s silent")
+                } else if c.total > 0 {
+                    format!("{}%", (c.done.min(c.total) * 100) / c.total)
+                } else {
+                    "planning".to_string()
+                });
+            f.render_widget(gauge, rows[i * 2 + 1]);
+        }
     }
 
+    let ledger_panel = right.len() - 1;
     let ledger: Vec<Line> = s
         .ledger
         .iter()
@@ -534,38 +559,6 @@ fn fmt_age(s: u64) -> String {
     } else {
         format!("{}h", s / 3600)
     }
-}
-
-/// btop-style braille dot bar: green fill, orange live edge, dim track.
-/// Unicode escapes, not literals: the glyphs survive any file encoding.
-fn braille_bar(frac: f64, width: usize, dead: bool) -> Vec<Span<'static>> {
-    if width == 0 {
-        return Vec::new();
-    }
-    if dead {
-        return vec![
-            Span::raw(" "),
-            Span::styled("\u{2800}".repeat(width), Style::default().fg(Color::DarkGray)),
-        ];
-    }
-    let filled = (frac.clamp(0.0, 1.0) * width as f64).round() as usize;
-    let mut spans = vec![Span::raw(" ")];
-    if filled > 0 {
-        if filled > 1 {
-            spans.push(Span::styled(
-                "\u{28BF}".repeat(filled - 1),
-                Style::default().fg(Color::Green),
-            ));
-        }
-        spans.push(Span::styled("\u{28BF}", Style::default().fg(Color::LightYellow)));
-    }
-    if filled < width {
-        spans.push(Span::styled(
-            "\u{2800}".repeat(width - filled),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    spans
 }
 
 /// Was this unit recorded by an archive pass (claim-less local mode)?
