@@ -20,10 +20,10 @@ use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Gauge, Paragraph, Row, Sparkline, Table};
+use ratatui::widgets::{Block, Cell, Paragraph, Row, Sparkline, Table};
 use ratatui::Frame;
 
 use crate::args::Args;
@@ -514,48 +514,46 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
                 ))),
                 rows[i * 2],
             );
-            // Gauge semantics (0.29 source): gauge_style patches the whole
-            // bar area -- fill renders as fg blocks, the percentage as
-            // fg-colored text over the unfilled part and auto-inverted
-            // (bg-colored text on fg) once the fill crosses it. No
-            // separate label style exists or is needed.
-            // Light blue on dark, per first human flight: this site's
-            // terminal palette renders ANSI green yellowish, and the
-            // knockout label takes fg from gauge_style.bg -- so bg=Black
-            // is what puts a DARK font on the light-blue bar.
-            let center = if stale {
+            // Custom text bar: no Gauge widget, no label overlay, no
+            // background style ANYWHERE -- there is no surface left for
+            // a palette-remapping terminal to paint a black square on.
+            // Solid blocks fill, faint blocks show the remainder, and
+            // the percentage is bold plain text at the right edge.
+            let bar = rows[i * 2 + 1];
+            let pct = if stale {
                 "ABANDONED".to_string()
             } else if c.total > 0 {
                 format!("{}%", (c.done.min(c.total) * 100) / c.total)
             } else {
                 "planning".to_string()
             };
-            let gauge = Gauge::default()
-                .ratio(frac)
-                .use_unicode(true)
-                // no center label and no bg ink: the bar sits on the
-                // terminal's own background (the ink band was ugly);
-                // the percentage lives on the owner row above
-                .gauge_style(Style::default().fg(if stale { RED } else { LIGHT_BLUE }))
-                .label("");
-            let bar = rows[i * 2 + 1];
-            f.render_widget(gauge, bar);
-            // last render wins: a compact chip carries the centered
-            // number, deep navy on it light text -- never black-on-band
-            let cw = center.chars().count() as u16 + 2;
-            if bar.width > cw + 4 {
-                let chip = Rect::new(bar.x + (bar.width - cw) / 2, bar.y, cw, 1);
-                f.render_widget(
-                    Paragraph::new(Line::from(Span::styled(
-                        format!(" {center} "),
-                        Style::default()
-                            .fg(Color::Rgb(8, 22, 40))
-                            .bg(if stale { RED } else { LIGHT_BLUE })
-                            .add_modifier(Modifier::BOLD),
-                    ))),
-                    chip,
-                );
+            let col = if stale { RED } else { LIGHT_BLUE };
+            let inner = (bar.width as usize)
+                .saturating_sub(pct.chars().count() + 2)
+                .max(1);
+            // work in eighths of a cell (same resolution ratatui's
+            // Gauge uses internally): exact math, no float drift
+            const PARTS: [&str; 7] = [
+                "\u{258F}", "\u{258E}", "\u{258D}", "\u{258C}",
+                "\u{258B}", "\u{258A}", "\u{2589}",
+            ];
+            let eighths = (frac * inner as f64 * 8.0).round() as usize;
+            let full = (eighths / 8).min(inner);
+            let rem = if full < inner { eighths % 8 } else { 0 };
+            let mut fill = "\u{2588}".repeat(full);
+            if rem > 0 {
+                fill.push_str(PARTS[rem - 1]);
             }
+            let empty = "\u{2591}".repeat(inner - fill.chars().count());
+            let line = Line::from(vec![
+                Span::styled(fill, Style::default().fg(col)),
+                Span::styled(empty, Style::default().fg(DIM)),
+                Span::styled(
+                    format!(" {pct}"),
+                    Style::default().fg(col).add_modifier(Modifier::BOLD),
+                ),
+            ]);
+            f.render_widget(Paragraph::new(line), bar);
         }
     }
 
@@ -681,6 +679,7 @@ pub fn run(a: &Args) -> R<()> {
         let mut inflight = false;
         let mut prev: HashMap<String, (u64, Instant)> = HashMap::new();
         let mut hist: VecDeque<f64> = VecDeque::new();
+        let mut prev_sealed: Option<(u64, Instant)> = None;
         let mut last_scan = Instant::now() - Duration::from_secs(scan_period);
         loop {
             if !paused && !inflight && last_scan.elapsed() >= Duration::from_secs(scan_period) {
@@ -709,6 +708,26 @@ pub fn run(a: &Args) -> R<()> {
                     }
                 }
                 prev.retain(|n, _| s.claims.iter().any(|(cn, _, _)| cn == n));
+                // fallback meter for archives run WITHOUT --claim: the
+                // byte ledger is then blank, but sealed bytes still grow
+                // scan to scan -- coarse (granularity = one unit's seal
+                // event), yet a real signal, not zero. Live claim
+                // deltas always win when present.
+                let sealed_now: u64 = s
+                    .units
+                    .iter()
+                    .filter(|u| u.state == State::Sealed)
+                    .map(|u| u.bytes)
+                    .sum();
+                if agg == 0.0 {
+                    if let Some((b, t)) = prev_sealed {
+                        let dt = t.elapsed().as_secs_f64();
+                        if sealed_now > b && dt > 0.5 {
+                            agg = (sealed_now - b) as f64 / dt;
+                        }
+                    }
+                }
+                prev_sealed = Some((sealed_now, Instant::now()));
                 s.rates = rates;
                 s.aggregate = agg;
                 hist.push_back(agg / (1u64 << 30) as f64);
