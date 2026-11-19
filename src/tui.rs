@@ -500,14 +500,18 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
             // fg-colored text over the unfilled part and auto-inverted
             // (bg-colored text on fg) once the fill crosses it. No
             // separate label style exists or is needed.
+            // Light blue on dark, per first human flight: this site's
+            // terminal palette renders ANSI green yellowish, and the
+            // knockout label takes fg from gauge_style.bg -- so bg=Black
+            // is what puts a DARK font on the light-blue bar.
             let gauge = Gauge::default()
                 .ratio(frac)
                 .use_unicode(true)
                 .gauge_style(Style::default().fg(if stale {
                     Color::Red
                 } else {
-                    Color::Green
-                }))
+                    Color::Cyan
+                }).bg(Color::Black))
                 .label(if stale {
                     format!("ABANDONED {age}s silent")
                 } else if c.total > 0 {
