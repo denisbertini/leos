@@ -411,10 +411,10 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
         let mut c = vec![Constraint::Length(5)];
         if !s.claims.is_empty() {
             c.push(Constraint::Length(s.claims.len().min(8) as u16 * 2 + 2));
-            if !s.history.is_empty() {
-                c.push(Constraint::Length(9));
-            }
         }
+        // throughput panel is always present: a fast archive's spike
+        // must be visible scrolling away, not vanish with the claims
+        c.push(Constraint::Length(9));
         c.push(Constraint::Min(3));
         c
     };
@@ -549,8 +549,8 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
                     Paragraph::new(Line::from(Span::styled(
                         format!(" {center} "),
                         Style::default()
-                            .fg(Color::Rgb(235, 240, 245))
-                            .bg(Color::Rgb(15, 30, 50))
+                            .fg(Color::Rgb(8, 22, 40))
+                            .bg(if stale { RED } else { LIGHT_BLUE })
                             .add_modifier(Modifier::BOLD),
                     ))),
                     chip,
@@ -563,13 +563,15 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
     // scan-to-scan deltas, accumulated in the driver; Sparkline renders
     // braille-resolution dots over a fixed 240-sample window (~12 min
     // at the default 3 s refresh)
-    if right.len() >= 3 && !s.history.is_empty() {
+    // the slot depends on whether the workers panel is present
+    let chart_i = if s.claims.is_empty() { 1 } else { 2 };
+    if right.len() >= 3 {
         let peak = s.history.iter().fold(0.0f64, |a, &v| a.max(v));
         let cur = *s.history.back().unwrap_or(&0.0);
         // Sparkline bars are u64 in 0.29 (quantize to 0.1 GiB/s steps)
         // and render the FIRST width samples: build an exactly-right-
         // aligned window so the series grows from the left and scrolls
-        let w = (right[2].width as usize).saturating_sub(2);
+        let w = (right[chart_i].width as usize).saturating_sub(2);
         let mut data: Vec<u64> = Vec::with_capacity(w);
         let shown = s.history.len().min(w);
         data.resize(w - shown, 0);
@@ -581,10 +583,10 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
             .data(data)
             .style(Style::default().fg(GREEN))
             .block(Block::bordered().title(format!(
-                " Aggregate EOS Throughput: {:.2} GiB/s (peak: {:.2}) ",
+                " EOS throughput {:.2} | peak {:.2} GiB/s ",
                 cur, peak
             )));
-        f.render_widget(spark, right[2]);
+        f.render_widget(spark, right[chart_i]);
     }
 
     let ledger_panel = right.len() - 1;
@@ -618,7 +620,7 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
         )
     };
     f.render_widget(
-        Paragraph::new(Span::styled(foot, Style::default().bg(DIM))),
+        Paragraph::new(Span::styled(foot, Style::default())),
         lines[2],
     );
 }
