@@ -566,18 +566,26 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
     if right.len() >= 3 {
         let peak = s.history.iter().fold(0.0f64, |a, &v| a.max(v));
         let cur = *s.history.back().unwrap_or(&0.0);
-        // Sparkline bars are u64 in 0.29 (quantize to 0.1 GiB/s steps)
-        // and render the FIRST width samples: build an exactly-right-
-        // aligned window so the series grows from the left and scrolls
+        // Resolution-independent: bars are NORMALIZED to the observed
+        // peak (steady rate = level line at ~77% height, 30% headroom)
+        // instead of an absolute 0.1 GiB/s grid -- an absolute axis
+        // tuned for cluster speeds clips desktop rates to zero (0.02
+        // GiB/s rendered an empty panel). Sparkline renders the FIRST
+        // width samples, so build an exactly-right-aligned window.
         let w = (right[chart_i].width as usize).saturating_sub(2);
         let mut data: Vec<u64> = Vec::with_capacity(w);
         let shown = s.history.len().min(w);
         data.resize(w - shown, 0);
-        data.extend(s.history.iter().skip(s.history.len() - shown).map(|v| (v * 10.0).round() as u64));
-        // explicit axis max keeps a steady rate as a level line with
-        // headroom, instead of ratatui's auto-max pinning it full-height
+        let norm = if peak > 0.0 { 100.0 / peak } else { 0.0 };
+        data.extend(
+            s.history
+                .iter()
+                .skip(s.history.len() - shown)
+                .map(|v| (v * norm).round() as u64),
+        );
+        // axis: normalized peak 100 + 30% headroom
         let spark = Sparkline::default()
-            .max(((peak * 10.0) * 1.3).ceil().max(4.0) as u64)
+            .max(130)
             .data(data)
             .style(Style::default().fg(GREEN))
             .block(Block::bordered().title(format!(
