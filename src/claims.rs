@@ -180,7 +180,7 @@ impl Guard {
             let mut c = self.claim.0.lock().unwrap();
             // monotonic: file-completion and the destination-size
             // monitor both publish; the claim only ever moves forward
-            c.done = c.done.max(done);
+            c.done = c.done.max(done).min(total);
             c.total = total;
             c.epoch = epoch_now();
         }

@@ -20,7 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Gauge, Paragraph, Row, Sparkline, Table};
@@ -44,7 +44,6 @@ const YELLOW: Color = Color::Rgb(255, 215, 95);     // READY
 const GREEN: Color = Color::Rgb(95, 215, 135);      // SEALED, sparkline
 const RED: Color = Color::Rgb(255, 95, 95);         // errors, abandoned
 const DIM: Color = Color::Rgb(120, 120, 120);       // secondary text
-const INK: Color = Color::Rgb(10, 10, 10);          // knockout label ink
 
 // ----------------------------------------------------------------- model
 
@@ -330,10 +329,7 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
     let mut hdr = vec![
         Span::styled(
             format!(" leos v{} ", env!("CARGO_PKG_VERSION")),
-            Style::default()
-                .fg(INK)
-                .bg(CYAN)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(LIGHT_BLUE).add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(" scan {}ms", s.scan_ms)),
     ];
@@ -527,6 +523,13 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
             // terminal palette renders ANSI green yellowish, and the
             // knockout label takes fg from gauge_style.bg -- so bg=Black
             // is what puts a DARK font on the light-blue bar.
+            let center = if stale {
+                "ABANDONED".to_string()
+            } else if c.total > 0 {
+                format!("{}%", (c.done.min(c.total) * 100) / c.total)
+            } else {
+                "planning".to_string()
+            };
             let gauge = Gauge::default()
                 .ratio(frac)
                 .use_unicode(true)
@@ -535,7 +538,24 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
                 // the percentage lives on the owner row above
                 .gauge_style(Style::default().fg(if stale { RED } else { LIGHT_BLUE }))
                 .label("");
-            f.render_widget(gauge, rows[i * 2 + 1]);
+            let bar = rows[i * 2 + 1];
+            f.render_widget(gauge, bar);
+            // last render wins: a compact chip carries the centered
+            // number, deep navy on it light text -- never black-on-band
+            let cw = center.chars().count() as u16 + 2;
+            if bar.width > cw + 4 {
+                let chip = Rect::new(bar.x + (bar.width - cw) / 2, bar.y, cw, 1);
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        format!(" {center} "),
+                        Style::default()
+                            .fg(Color::Rgb(235, 240, 245))
+                            .bg(Color::Rgb(15, 30, 50))
+                            .add_modifier(Modifier::BOLD),
+                    ))),
+                    chip,
+                );
+            }
         }
     }
 

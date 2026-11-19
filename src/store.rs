@@ -127,6 +127,54 @@ fn preflight_write(c: &Cfg, dst: &str) -> R<()> {
     })
 }
 
+
+/// Bytes read from disk by direct children of this process (xrdcp,
+/// eos cp) via /proc: linux, same-uid, no privileges. The transfer
+/// oracle that makes fleet progress live even when the store reports
+/// nothing about files still open.
+fn children_read_bytes() -> u64 {
+    let me = std::process::id();
+    let mut total = 0u64;
+    let rd = match std::fs::read_dir("/proc") {
+        Ok(rd) => rd,
+        Err(_) => return 0,
+    };
+    for e in rd.flatten() {
+        let pid: u32 = match e.file_name().to_string_lossy().parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let stat = match std::fs::read(format!("/proc/{pid}/stat")) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // ppid is the field after the ')' of comm (comm may hold spaces)
+        let s = String::from_utf8_lossy(&stat);
+        let ppid: u32 = match s
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().nth(1))
+            .and_then(|p| p.parse().ok())
+        {
+            Some(p) => p,
+            None => continue,
+        };
+        if ppid != me {
+            continue;
+        }
+        if let Ok(io) = std::fs::read_to_string(format!("/proc/{pid}/io")) {
+            for line in io.lines() {
+                // rchar: bytes via read() syscalls, page-cache included
+                // -- read_bytes counts only block I/O and would be zero
+                // for exactly the cached reads a mover thrives on
+                if let Some(v) = line.strip_prefix("rchar:") {
+                    total += v.trim().parse().unwrap_or(0);
+                }
+            }
+        }
+    }
+    total
+}
+
 pub fn run_archive(a: &Args) -> R<()> {
     let src = PathBuf::from(a.pos1("lustre-path")?);
     if !src.is_dir() {
@@ -297,22 +345,31 @@ fn archive_unit(
     let stop_mon = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let results = std::thread::scope(|scope| {
         let mon = claim.map(|g| {
-            let (b2, work2, stop2, total) = (
-                    b.clone(),
-                    work.clone(),
-                    std::sync::Arc::clone(&stop_mon),
-                    bytes,
-                );
+            let (b2, work2, stop2, total, done_c) = (
+                b.clone(),
+                work.clone(),
+                std::sync::Arc::clone(&stop_mon),
+                bytes,
+                std::sync::Arc::clone(&done),
+            );
             scope.spawn(move || loop {
                 if stop2.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                let seen: u64 = work2
+                // two independent live views, keep the better one:
+                //  * destination sizes (instant on local copy; EOS only
+                //    reports an open file's size at close)
+                //  * completed files + bytes our own copy-children have
+                //    read, metered on THIS node via /proc/<child>/io --
+                //    authoritative, needs nothing from the store
+                let dest: u64 = work2
                     .iter()
                     .map(|(_, remote, want)| b2.size(remote).unwrap_or(0).min(*want))
                     .sum();
-                g.progress(seen, total);
-                std::thread::sleep(std::time::Duration::from_secs(2));
+                let kids = done_c.load(std::sync::atomic::Ordering::Relaxed)
+                    + children_read_bytes();
+                g.progress(dest.max(kids), total);
+                std::thread::sleep(std::time::Duration::from_secs(1));
             })
         });
         let res = parallel(work, c.jobs, |_i, (local, remote, want)| {
@@ -751,4 +808,23 @@ pub fn run_janitor(a: &Args) -> R<()> {
     }
     records_write(&state, &keep)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod io_meter_tests {
+    #[test]
+    fn children_bytes_are_metered_live() {
+        // a dd child reading /dev/zero: pure syscall reads (rchar grows,
+        // read_bytes stays zero) -- exactly the xrdcp signature
+        let child = std::process::Command::new("dd")
+            .args(["if=/dev/zero", "of=/dev/null", "bs=1M", "count=5000"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let seen = super::children_read_bytes();
+        let _ = child.wait_with_output();
+        assert!(seen > 10 << 20, "meter saw only {seen} bytes from a busy child");
+    }
 }
