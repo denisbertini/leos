@@ -495,10 +495,14 @@ fn draw(f: &mut Frame, s: &Snapshot, paused: bool, next_scan: Duration) {
                 ))),
                 rows[i * 2],
             );
+            // Gauge semantics (0.29 source): gauge_style patches the whole
+            // bar area -- fill renders as fg blocks, the percentage as
+            // fg-colored text over the unfilled part and auto-inverted
+            // (bg-colored text on fg) once the fill crosses it. No
+            // separate label style exists or is needed.
             let gauge = Gauge::default()
                 .ratio(frac)
                 .use_unicode(true)
-                .style(Style::default().fg(Color::DarkGray))
                 .gauge_style(Style::default().fg(if stale {
                     Color::Red
                 } else {
