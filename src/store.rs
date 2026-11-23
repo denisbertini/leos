@@ -85,6 +85,11 @@ fn token(a: &Args) -> Option<String> {
 /// file will be dead on every remaining file. Continuing only burns planning.
 fn auth_suspect(e: &str) -> bool {
     let l = e.to_lowercase();
+    // EEXIST is never authentication, whatever else the message quotes
+    // (the embedded copy-URL mentions "authz" even redacted)
+    if l.contains("errno=17") || l.contains("file exists") || l.contains("[3018]") {
+        return false;
+    }
     [
         "permission denied",
         "public access",
@@ -317,7 +322,14 @@ fn archive_unit(
         dst_target
     ));
 
-    // 1. remote directories (serial: cheap, avoids mkdir races)
+    // 1. remote directories (serial: cheap, avoids mkdir races).
+    //    The unit ROOT itself must be created here too, not left implicit:
+    //    flat units (bp5: files only, no subdirs) would then have NO dir
+    //    pre-created, and every parallel copy child falls back to an
+    //    on-the-fly mkdir -- eight children, one directory, EEXIST lost
+    //    (eos cp treats "File exists" as fatal; seen as errno=17/3018
+    //    killing unit 0 of a 21-unit deck under --jobs=8).
+    c.backend.make_dirs(&dst_target)?;
     for d in &walked.dirs {
         c.backend.make_dirs(&Backend::join(&dst_target, d))?;
     }

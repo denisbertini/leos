@@ -64,11 +64,38 @@ fn head(s: &str, n: usize) -> String {
     }
 }
 
+/// Redact capability tokens from anything that becomes error text.
+/// `?authz=<token>` rides as a query parameter terminated by whitespace or
+/// quotes.  Field lesson twice over: the token leaked verbatim into an
+/// archive log, and worse, `auth_suspect()` keys on the literal "authz" --
+/// so ANY message quoting a URL looked like an authentication failure and
+/// aborted the whole pass (an errno=17 mkdir race was diagnosed as
+/// "authentication-class failure" this way).
+pub fn scrub_creds(s: &str) -> String {
+    const K: &str = "authz=";
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find(K) {
+        out.push_str(&rest[..i]);
+        out.push_str("authz=[redacted]");
+        let after = &rest[i + K.len()..];
+        rest = match after.find(|c: char| c.is_whitespace() || c == '"' || c == '\'') {
+            Some(j) => &after[j..],
+            None => "",
+        };
+    }
+    out.push_str(rest);
+    out
+}
+
 fn err_cmd(what: &str, cmd: &std::process::Output) -> String {
     let code = cmd.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into());
     // keep the HEAD of stderr: real complaints come first, progress/warning
     // summaries last (field lesson: tail-truncation hid the actual error)
-    format!("{what}: exit={code} {}", head(&String::from_utf8_lossy(&cmd.stderr), 400))
+    scrub_creds(&format!(
+        "{what}: exit={code} {}",
+        head(&String::from_utf8_lossy(&cmd.stderr), 400)
+    ))
 }
 
 impl Backend {
@@ -526,6 +553,17 @@ mod tests {
         assert_eq!(e.kind, Kind::EosCp);
         let err = e.copy_from("/eos/a/f1", Path::new("/nonexistent/x")).unwrap_err();
         assert!(err.contains("xrdcp") && err.contains("source"), "{err}");
+    }
+
+    #[test]
+    fn creds_scrubbed_from_error_text() {
+        // token in a quoted URL, mid-sentence, and at end of string
+        let s = "eos cp: exit=239 stderr: failed copying path=root://h//eos/a/data.5?\
+                 authz=zteos64:TOKEN+eq/== \n and again authz=ABC";
+        let t = scrub_creds(s);
+        assert!(!t.contains("zteos64") && !t.contains("ABC"), "{t}");
+        assert!(t.contains("data.5?authz=[redacted]"), "{t}");
+        assert!(t.ends_with("authz=[redacted]"), "{t}");
     }
 
     #[test]
