@@ -90,11 +90,12 @@ transfer options (archive/restore):
   --allow-unverified                           accept stores where stat fails
 
 capability tokens (Helios EOS):
-  --token=TOK   or $LEOS_TOKEN, or plain $EOSAUTHZ. The token is passed to
-                eos/xrdcp children as $EOSAUTHZ and appended as ?authz= on
-                copy URLs. Note: `eos cp` cannot READ with a token (upstream
-                XRootD bug: authz applies to destinations only), so restore
-                and verify --round-trip must address units as
+  --token=TOK   or $LEOS_TOKEN, or plain $EOSAUTHZ. The token is appended as
+                ?authz= to copy URLs AND to xrdfs metadata paths (stat/ls/
+                mkdir/mv/rm) — verified on Helios 2026-11-24. Note: `eos cp`
+                cannot READ with a token (upstream XRootD bug: authz applies
+                to destinations only), so restore and verify --round-trip
+                must address units as
                 root://<mgm-host>//eos/... (auto-selects the xrdcp backend).
                 Tokens expire -- leos failures are resumable: re-issue the
                 token, rerun; .incomplete trees are picked up or swept.

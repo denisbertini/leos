@@ -613,10 +613,33 @@ fn verify_remote(a: &Args, remote_unit: &str, round_trip: bool) -> R<()> {
                 return Err(format!("round-trip verification failed: {e}"));
             }
         } else {
+            // one listing catches wholesale absence cheaply (BP5 units are
+            // flat directories, a top-level ls covers them); sizes still go
+            // per-file through stat, which carries the token since 2026-11-24
+            let known: Option<std::collections::HashSet<String>> = match c.backend.list(remote_unit) {
+                Ok(entries) if !entries.is_empty() => {
+                    // eos find prints sizes (drop 0-size anomalies); xrdfs ls
+                    // prints paths only — then every row counts as present
+                    let sized = entries.iter().any(|(_, sz)| *sz != 0);
+                    Some(
+                        entries
+                            .into_iter()
+                            .filter(|(_, sz)| !sized || *sz != 0)
+                            .map(|(p, _)| p)
+                            .collect(),
+                    )
+                }
+                _ => None, // listing unsupported here: fall back to pure stat
+            };
             let work: Vec<(String, u64)> =
                 manifest.entries.iter().map(|e| (e.rel.clone(), e.size)).collect();
             let b = c.backend.clone();
             let results = parallel(work, c.jobs, move |_i, (rel, want)| {
+                if let Some(k) = &known {
+                    if !k.contains(rel.as_str()) {
+                        return Err(format!("missing on store: {remote_unit}/{rel}"));
+                    }
+                }
                 let r = Backend::join(remote_unit, &rel);
                 match b.size(&r) {
                     Some(g) if g == want => Ok(()),

@@ -3,12 +3,16 @@
 //! so site authentication (kinit, tokens) stays with the tools that already
 //! work. `Copy` is a local-filesystem backend for testing and dry-runs.
 //!
-//! Capability tokens (Helios-style): the token is handed to every child as
-//! `EOSAUTHZ` (metadata ops: mkdir/mv/rm/file stat authenticate that way) and
-//! appended as `?authz=` on copy URLs (data transfer). Reads through
-//! `eos cp` with a token are refused: the XRootD client applies authz only
-//! to copy *destinations*, never sources (known eos cp_cmd_native.cc bug),
-//! so downloads must go through xrdcp with the token on the source URL.
+//! Capability tokens (Helios-style): copy URLs carry `?authz=` (data
+//! transfer), and `xrdfs` metadata RPCs (stat/ls/mkdir/mv/rm) carry it the
+//! same way, appended to the path operand — verified on Helios 2026-11-24.
+//! Session env vars (XrdSecsssENDORSEMENT, EOS_SESSION_TOKEN) do NOT
+//! authenticate metadata on current builds, and the `EOSAUTHZ` env only
+//! reaches the eos console, never xrdfs: attach the token per request.
+//! Reads through `eos cp` with a token are refused: the XRootD client
+//! applies authz only to copy *destinations*, never sources (known eos
+//! cp_cmd_native.cc bug), so downloads must go through xrdcp with the token
+//! on the source URL.
 
 use std::path::Path;
 use std::process::Command;
@@ -180,6 +184,30 @@ impl Backend {
         }
     }
 
+    /// Bare path for `xrdfs` RPCs, token appended as `?authz=`. Field lesson
+    /// (Helios, 2026-11-24): stat/dirlist/mkdir/mv/rm DO honor the token when
+    /// it rides the path as CGI — the session env vars (XrdSecsssENDORSEMENT,
+    /// EOS_SESSION_TOKEN) do NOT on current builds. The old code sent bare
+    /// paths here and concluded "metadata through tokens is broken"; it was
+    /// our client forgetting the credential.
+    fn rpc_path(&self, path: &str) -> String {
+        let base = Self::rpath(path).to_string();
+        match &self.token {
+            Some(t) if !base.contains("?authz=") => format!("{base}?authz={t}"),
+            _ => base,
+        }
+    }
+
+    /// token appended as `?authz=` (for the second argument of `xrdfs mv`,
+    /// which takes one CGI like every other path operand)
+    fn rpc_dst(&self, path: &str) -> String {
+        let base = path.to_string();
+        match &self.token {
+            Some(t) if !base.contains("?authz=") => format!("{base}?authz={t}"),
+            _ => base,
+        }
+    }
+
     /// full xrootd URL for copy commands, token appended as an authz query
     fn url(&self, path: &str) -> String {
         let base = match self.kind {
@@ -249,11 +277,13 @@ impl Backend {
                 let h = self.host.as_deref()?;
                 let out = self
                     .cmd("xrdfs")
-                    .args([h, "stat", Self::rpath(path)])
+                    .args([h, "stat", &self.rpc_path(path)])
                     .output()
                     .ok()?;
+                // real builds print `Path:/Id:/Size:` lines, never "Status=OK"
+                // (the old check); a successful stat always carries Size
                 Some(out.status.success()
-                    && String::from_utf8_lossy(&out.stdout).contains("Status=OK"))
+                    && String::from_utf8_lossy(&out.stdout).contains("Size"))
             }
         }
     }
@@ -278,13 +308,60 @@ impl Backend {
                 let h = self.host.as_deref()?;
                 let o = self
                     .cmd("xrdfs")
-                    .args([h, "stat", Self::rpath(path)])
+                    .args([h, "stat", &self.rpc_path(path)])
                     .output()
                     .ok()?;
                 if !o.status.success() {
                     return None;
                 }
                 parse_size(&String::from_utf8_lossy(&o.stdout))
+            }
+        }
+    }
+
+    /// Recursive listing of a remote subtree as (path, size) pairs. Token
+    /// rides the URL CGI — proven working on Helios 2026-11-24 (`xrdfs ls`
+    /// with ?authz= lists a whole archive). Used by remote verification to
+    /// compare the manifest against what the store actually holds.
+    pub fn list(&self, dir: &str) -> R<Vec<(String, u64)>> {
+        match self.kind {
+            Kind::Copy => {
+                fn walk(dir: &Path, out: &mut Vec<(String, u64)>) -> std::io::Result<()> {
+                    for e in std::fs::read_dir(dir)? {
+                        let e = e?;
+                        let p = e.path();
+                        if p.is_dir() {
+                            walk(&p, out)?;
+                        } else if let Ok(m) = std::fs::metadata(&p) {
+                            out.push((p.display().to_string(), m.len()));
+                        }
+                    }
+                    Ok(())
+                }
+                let mut out = Vec::new();
+                walk(Path::new(dir), &mut out).map_err(|e| format!("walk {dir}: {e}"))?;
+                Ok(out)
+            }
+            Kind::EosCp => {
+                let o = self.cmd("eos").args(["find", dir, "-name", "*"]).output()
+                    .map_err(|e| format!("spawn eos find: {e}"))?;
+                if !o.status.success() {
+                    return Err(err_cmd(&format!("eos find {dir}"), &o));
+                }
+                Ok(parse_ls_lines(&String::from_utf8_lossy(&o.stdout), dir))
+            }
+            Kind::Xrdcp => {
+                let h = self.host()?;
+                let bare = Self::rpath(dir).to_string();
+                let o = self.cmd("xrdfs").args([h, "ls", &self.rpc_path(dir)]).output()
+                    .map_err(|e| format!("spawn xrdfs ls: {e}"))?;
+                if !o.status.success() {
+                    return Err(err_cmd(&format!("xrdfs ls {dir}"), &o));
+                }
+                // ls prints bare /eos/... paths, so relativize against the
+                // bare path, never the root:// URL the caller passed (field
+                // bug 2026-11-24: URL base made every entry fail to match)
+                Ok(parse_ls_lines(&String::from_utf8_lossy(&o.stdout), &bare))
             }
         }
     }
@@ -306,7 +383,7 @@ impl Backend {
             Kind::Xrdcp => {
                 let h = self.host()?;
                 let dir = Self::rpath(dir).to_string();
-                let o = self.cmd("xrdfs").args([h, "mkdir", "-p", &dir]).output()
+                let o = self.cmd("xrdfs").args([h, "mkdir", "-p", &self.rpc_path(&dir)]).output()
                     .map_err(|e| format!("spawn xrdfs mkdir: {e}"))?;
                 if o.status.success() || self.exists(&dir) == Some(true) {
                     return Ok(());
@@ -318,7 +395,7 @@ impl Backend {
                         continue;
                     }
                     cur = format!("{cur}/{part}");
-                    let _ = self.cmd("xrdfs").args([h, "mkdir", &cur]).output();
+                    let _ = self.cmd("xrdfs").args([h, "mkdir", &self.rpc_path(&cur)]).output();
                 }
                 if self.exists(&dir) == Some(true) {
                     Ok(())
@@ -418,8 +495,8 @@ impl Backend {
             }
             Kind::Xrdcp => {
                 let h = self.host()?;
-                let (from, to) = (Self::rpath(from), Self::rpath(to));
-                let o = self.cmd("xrdfs").args([h, "mv", from, to]).output()
+                let (from, to) = (self.rpc_path(from), self.rpc_dst(Self::rpath(to)));
+                let o = self.cmd("xrdfs").args([h, "mv", &from, &to]).output()
                     .map_err(|e| format!("spawn xrdfs mv: {e}"))?;
                 if o.status.success() { Ok(()) } else { Err(err_cmd("xrdfs mv", &o)) }
             }
@@ -450,7 +527,7 @@ impl Backend {
             }
             Kind::Xrdcp => {
                 let h = self.host()?;
-                let _ = self.cmd("xrdfs").args([h, "rm", Self::rpath(path)]).output()
+                let _ = self.cmd("xrdfs").args([h, "rm", &self.rpc_path(path)]).output()
                     .map_err(|e| format!("spawn xrdfs rm: {e}"))?;
                 Ok(())
             }
@@ -501,10 +578,37 @@ fn parse_first_u64(s: &str) -> Option<u64> {
     None
 }
 
-/// tolerate `size=NNN`, `size: NNN`, `size NNN` in stat outputs
+/// one `path [size]` per line, as printed by `xrdfs ls` (paths only) and
+/// `eos find` (path plus stat columns; size is the second field there).
+/// Paths are made relative to `dir`; lines outside `dir` are dropped.
+fn parse_ls_lines(s: &str, dir: &str) -> Vec<(String, u64)> {
+    let base = dir.trim_end_matches('/');
+    let mut out = Vec::new();
+    for line in s.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (path, size) = match line.split_once(' ') {
+            Some((p, rest)) => (p, parse_first_u64(rest).unwrap_or(0)),
+            None => (line, 0),
+        };
+        if let Some(rel) = path.strip_prefix(base) {
+            out.push((rel.trim_start_matches('/').to_string(), size));
+        } else {
+            out.push((path.to_string(), size));
+        }
+    }
+    out.retain(|(p, _)| !p.is_empty());
+    out
+}
+
+/// tolerate `size=NNN`, `size: NNN`, `size NNN`, `Size: NNN` in stat outputs
 fn parse_size(s: &str) -> Option<u64> {
     let bytes = s.as_bytes();
-    let idx = bytes.windows(4).position(|w| w == b"size")?;
+    let idx = bytes
+        .windows(4)
+        .position(|w| w.eq_ignore_ascii_case(b"size"))?;
     let mut i = idx + 4;
     while i < bytes.len() && (bytes[i] == b'=' || bytes[i] == b' ' || bytes[i] == b':') {
         i += 1;
@@ -575,5 +679,46 @@ mod tests {
         assert_eq!(parse_first_u64("2474760192\n"), Some(2474760192));
         assert_eq!(parse_first_u64("size: 3 bytes"), Some(3));
         assert_eq!(parse_first_u64("no digits here"), None);
+        // real Helios xrdfs stat output (2026-11-24): "Size:   5"
+        assert_eq!(parse_size("Path: /eos/x\nId: 51967\nSize:   5\n"), Some(5));
+    }
+
+    #[test]
+    fn rpc_paths_carry_token() {
+        let b = Backend::from_args("auto", "root://h//eos/a", 4, "", Some("TOK=x/==")).unwrap();
+        // metadata RPCs get host-stripped paths WITH the token
+        assert_eq!(b.rpc_path("root://h//eos/a/f1"), "/eos/a/f1?authz=TOK=x/==");
+        assert_eq!(b.rpc_path("/eos/a/f1"), "/eos/a/f1?authz=TOK=x/==");
+        // never double the CGI
+        assert_eq!(b.rpc_path("/eos/a?authz=GONE"), "/eos/a?authz=GONE");
+        // mv destination gets it too
+        assert_eq!(b.rpc_dst("/eos/a/to"), "/eos/a/to?authz=TOK=x/==");
+        // no token => bare operand
+        let b0 = Backend::from_args("auto", "root://h//eos/a", 4, "", None).unwrap();
+        assert_eq!(b0.rpc_path("root://h//eos/a/f1"), "/eos/a/f1");
+    }
+
+    #[test]
+    fn ls_lines_parse() {
+        // xrdfs ls: absolute paths, no sizes (size 0 = unknown, stat fills in)
+        let l = parse_ls_lines(
+            "/eos/a/u/md.0\n/eos/a/u/data.0\n/eos/a/u/sub/x\n",
+            "/eos/a/u",
+        );
+        assert_eq!(l, vec![
+            ("md.0".into(), 0u64),
+            ("data.0".into(), 0u64),
+            ("sub/x".into(), 0u64),
+        ]);
+        // eos find: path + stat columns, size is a later field
+        let f = parse_ls_lines("/eos/a/u/md.0 12 33 44 2474760192\n", "/eos/a/u");
+        assert_eq!(f, vec![("md.0".into(), 12u64)]); // first number after path
+        // THE trap (field bug 2026-11-24): callers hold root:// URLs but ls
+        // prints bare paths — relativizing must use rpath(dir), not dir.
+        let url_base = "root://h//eos/a/u";
+        let wrong = parse_ls_lines("/eos/a/u/md.0\n", url_base);
+        assert_eq!(wrong[0].0, "/eos/a/u/md.0"); // unmatched prefix stays absolute
+        let right = parse_ls_lines("/eos/a/u/md.0\n", Backend::rpath(url_base));
+        assert_eq!(right, vec![("md.0".into(), 0u64)]);
     }
 }
